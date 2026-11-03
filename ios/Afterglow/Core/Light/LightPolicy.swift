@@ -77,7 +77,7 @@ struct LightBounds: Hashable {
     /// built-in programs stay below 15 Hz and the UI warns when a custom rate goes above it.
     var frequencyRange: ClosedRange<Double>
     var dutyRange: ClosedRange<Double>
-    /// Shortest on or off pulse accepted (main-queue scheduling resolution).
+    /// Shortest planned on or off interval accepted; not an optical timing guarantee.
     var minimumPulse: TimeInterval
     var maximumLightDuration: TimeInterval
     var brightnessCeiling: Float

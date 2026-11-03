@@ -93,7 +93,7 @@ final class SessionPlayer: ObservableObject {
     /// Dark pause before light comes back after a resume or returning to the app.
     static let lightResumeHold: TimeInterval = 4
 
-    /// Measured flash timing for the current light run.
+    /// API-command timing for the current light run; not measured optical output.
     var lightTiming: TorchDriver.Stats? { torch?.timingStats }
 
     /// Nominal flash frequency right now, while light is on.
@@ -453,6 +453,9 @@ final class SessionPlayer: ObservableObject {
         case .timeout:
             lightBlockedThisSession = true
             notice = .lightStopped("It reached its time limit.")
+        case .cannotKeepUp:
+            lightBlockedThisSession = true
+            notice = .lightStopped("The flashlight cannot keep up with this program. Audio continues.")
         case .thermal:
             lightBlockedThisSession = true
             notice = .lightStopped("Your device is warm.")

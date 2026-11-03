@@ -248,6 +248,31 @@ final class SessionPlayerTests: XCTestCase {
     private var screenAwake = false
     private var lastTorch: TorchController?
 
+    func testProductionWorkerOffRejectionReachesPersistentWarningDespiteCleanupRetry() async throws {
+        let hardware = AdversarialTorch()
+        hardware.rejectPositive = true
+        // Initial preflight off succeeds; only worker shutdown rejects an off request.
+        hardware.beforePositive = { hardware.rejectOffCount = 1 }
+        let subject = SessionPlayer(
+            history: history, audio: audio, notificationCenter: NotificationCenter(),
+            usesTimer: false, integratesWithSystemMedia: false, lightBuildEnabled: true,
+            lightLeadIn: 0, isAppActive: { true }, keepScreenAwake: { _ in },
+            makeTorch: { TorchController(device: hardware, notificationCenter: NotificationCenter()) }
+        )
+        var configuration = lightSession
+        configuration.lightLeadIn = 0
+        subject.start(configuration)
+        let deadline = MonotonicClock.now() + 3
+        while subject.lightShutdownWarning == nil && MonotonicClock.now() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNotNil(subject.lightShutdownWarning)
+        XCTAssertFalse(subject.isLightActive)
+        subject.end()
+        subject.reset()
+        XCTAssertNotNil(subject.lightShutdownWarning, "Successful cleanup cannot clear the persistent warning")
+    }
+
     private func makeLightPlayer(buildEnabled: Bool, torch: FakeTorch) -> SessionPlayer {
         SessionPlayer(
             history: history,
