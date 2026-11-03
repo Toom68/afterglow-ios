@@ -232,12 +232,18 @@ final class TorchController {
         if thermalState().rawValue >= ProcessInfo.ThermalState.serious.rawValue { return hardStop(.thermal) }
         guard let planned = plan.relativeLevel(at: elapsed) else { return hardStop(.finished) }
         let relative = elapsed < holdUntil ? 0 : planned
+        var adapterCap: Float = 0
         if relative > 0 {
             guard device.isTorchAvailable else { return hardStop(.failure(.torchUnavailable)) }
-            // An adapter may withdraw its request cap; stop rather than compensate.
-            guard device.maxAvailableLevel > 0 else { return hardStop(.thermal) }
+            adapterCap = device.maxAvailableLevel
+            guard adapterCap.isFinite, adapterCap > 0 else { return hardStop(.thermal) }
+            let admissionTime = clock() - startedAt
+            if admissionTime >= Self.hardTimeout { return hardStop(.timeout) }
+            if admissionTime >= plan.totalDuration { return hardStop(.finished) }
+            if thermalState().rawValue >= ProcessInfo.ThermalState.serious.rawValue { return hardStop(.thermal) }
+            if admissionTime >= (plan.nextBoundary(after: elapsed) ?? plan.totalDuration) { return hardStop(.cannotKeepUp) }
         }
-        let ceiling = min(Self.bounds.brightnessCeiling, peakOverride ?? plan.peakTorchLevel, device.maxAvailableLevel)
+        let ceiling = min(Self.bounds.brightnessCeiling, peakOverride ?? plan.peakTorchLevel, adapterCap)
         let level = relative <= 0 ? 0 : relative * ceiling
         if level != currentLevel {
             do {

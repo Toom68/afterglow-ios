@@ -171,15 +171,27 @@ final class AdversarialTorch: TorchDevice, @unchecked Sendable {
     var rejectPositive = false
     var rejectOffCount = 0
     var beforePositive: (() -> Void)?
+    var beforeAcquire: (() -> Void)?
+    var beforeOff: (() -> Void)?
+    var beforeRelease: (() -> Void)?
+    var caps: [Float] = [1]
+    private var capReads = 0
+    func beginExclusiveControl() throws { beforeAcquire?() }
+    func endExclusiveControl() { beforeRelease?() }
     var hasTorch: Bool { true }
     var isTorchAvailable: Bool { advance(capabilityDelay); return true }
-    var maxAvailableLevel: Float { 1 }
+    var maxAvailableLevel: Float {
+        lock.lock(); defer { lock.unlock() }
+        let cap = caps[min(capReads, caps.count - 1)]
+        capReads += 1
+        return cap
+    }
     var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return time }
     var commands: [Command] { lock.lock(); defer { lock.unlock() }; return recorded }
     func advance(_ delay: TimeInterval) { lock.lock(); time += delay; lock.unlock() }
     func setLevel(_ level: Float) throws {
         let issued = now
-        if level > 0 { beforePositive?() }
+        if level > 0 { beforePositive?() } else { beforeOff?() }
         advance(level > 0 ? positiveDelay : offDelay)
         lock.lock()
         recorded.append(Command(level: level, issued: issued, returned: time))
@@ -342,23 +354,119 @@ final class TorchDriverAdversarialTests: XCTestCase {
         XCTAssertEqual(torch.commands.map(\.level), [0.5, 0, 0])
     }
 
-    func testStatsPeakAndCancelRequestDoNotWaitForBlockedHardware() {
+    func testBothTerminationOffRequestsCanFailAndErrorStillPublishes() {
         let torch = AdversarialTorch()
-        let entered = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
-        torch.beforePositive = { entered.signal(); _ = release.wait(timeout: .now() + 3) }
-        let playback = driver(plan(), torch) { _ in }
+        torch.rejectOffCount = 2
+        let stopped = expectation(description: "both off attempts rejected")
+        let playback = driver(plan(1, duration: 0.02), torch) { _ in stopped.fulfill() }
         playback.start()
-        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
-        let start = MonotonicClock.now()
-        XCTAssertEqual(playback.stats.commands, 0)
-        playback.setPeak(0.08)
-        playback.requestCancel()
-        XCTAssertLessThan(MonotonicClock.now() - start, 0.1)
-        release.signal()
-        playback.cancel() // Shutdown barrier: no commands can follow after this returns.
-        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0])
-        XCTAssertNil(playback.offCommandError)
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(playback.offCommandError, .configurationFailed("off rejected"))
+        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0, 0], "Recorded attempts do not establish darkness")
+    }
+
+    func testStatsPeakAndCancelRequestDoNotWaitForBlockedHardware() {
+        for phase in 0..<4 {
+            let torch = AdversarialTorch()
+            let entered = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let block = { entered.signal(); _ = release.wait(timeout: .now() + 3) }
+            switch phase {
+            case 0: torch.beforeAcquire = block
+            case 1: torch.beforePositive = block
+            case 2: torch.beforeOff = block
+            default: torch.beforeRelease = block
+            }
+            let playback = driver(plan(1, duration: 0.02), torch) { _ in }
+            playback.start()
+            XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+            let start = MonotonicClock.now()
+            _ = playback.stats
+            playback.setPeak(0.08)
+            playback.requestCancel()
+            XCTAssertLessThan(MonotonicClock.now() - start, 0.1)
+            release.signal()
+            playback.cancel() // No commands follow the serialized shutdown barrier.
+            XCTAssertEqual(torch.commands.map(\.level), phase == 0 ? [0] : [0.5, 0])
+            XCTAssertNil(playback.offCommandError)
+        }
+    }
+
+    func testInvalidCapsNeverIssuePositiveRequests() {
+        for cap in [Float(-0.5), 0, .nan, .infinity] {
+            let torch = AdversarialTorch()
+            torch.caps = [cap]
+            let stopped = expectation(description: "invalid cap")
+            let playback = driver(plan(), torch) { reason in
+                XCTAssertEqual(reason, .thermal)
+                stopped.fulfill()
+            }
+            playback.start()
+            wait(for: [stopped], timeout: 2)
+            XCTAssertEqual(torch.commands.map(\.level), [0])
+        }
+    }
+
+    func testThermalChangeDuringCapabilityQueryPreventsPositiveAdmission() {
+        let torch = AdversarialTorch()
+        torch.capabilityDelay = 0.03
+        let stopped = expectation(description: "thermal admission")
+        let playback = driver(plan(), torch, thermal: { torch.now >= 0.02 ? .serious : .nominal }) { reason in
+            XCTAssertEqual(reason, .thermal)
+            stopped.fulfill()
+        }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(torch.commands.map(\.level), [0])
+    }
+
+    func testStableInstantaneousAdapterCompletesLongPlansAtTenAndTwentyHz() {
+        for hz in [10.0, 20.0] {
+            let torch = AdversarialTorch()
+            let stopped = expectation(description: "stable virtual minute")
+            let playback = driver(plan(hz, duration: 60), torch) { reason in
+                XCTAssertEqual(reason, .finished)
+                stopped.fulfill()
+            }
+            playback.start()
+            wait(for: [stopped], timeout: 2)
+            XCTAssertEqual(playback.stats.flashes, Int(60 * hz))
+            XCTAssertEqual(playback.stats.dropped, 0)
+            XCTAssertEqual(torch.now, 60, accuracy: 1e-9)
+            XCTAssertEqual(torch.commands.last?.level, 0)
+        }
+    }
+
+    func testSmallPersistentCommandLatencyEventuallyStopsRatherThanCompresses() {
+        let torch = AdversarialTorch()
+        torch.positiveDelay = 0.001
+        torch.offDelay = 0.001
+        let stopped = expectation(description: "sustained latency")
+        let playback = driver(plan(20, duration: 60), torch) { reason in
+            XCTAssertEqual(reason, .cannotKeepUp)
+            stopped.fulfill()
+        }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertGreaterThan(playback.stats.flashes, 1)
+        XCTAssertGreaterThan(playback.stats.dropped, 0)
+        XCTAssertLessThan(torch.now, 60)
+        XCTAssertEqual(torch.commands.last?.level, 0)
+    }
+
+    func testAdapterCapIsSampledOncePerPositiveEdgeAndWithdrawalStopsPlayback() {
+        let torch = AdversarialTorch()
+        torch.caps = [0.08, 0]
+        let stopped = expectation(description: "cap withdrawn")
+        let playback = driver(plan(10, peak: 0.5), torch) { reason in
+            XCTAssertEqual(reason, .thermal)
+            stopped.fulfill()
+        }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(torch.commands.map(\.level), [0.08, 0, 0])
+        XCTAssertEqual(playback.stats.flashes, 1)
+        XCTAssertEqual(playback.stats.dropped, 9)
     }
 
     func testCancelBeforeStartStillShutsDownOnWorker() {
@@ -386,5 +494,64 @@ final class TorchDriverAdversarialTests: XCTestCase {
         for (command, edge) in zip(positive, rendered.edges.filter { $0.level > 0 }) {
             XCTAssertLessThanOrEqual(command.level, edge.level * rendered.peakTorchLevel)
         }
+    }
+}
+
+@MainActor
+final class TorchControllerAdversarialTests: XCTestCase {
+    private var plan: LightPlan {
+        LightPlan(program: .custom(startHz: 10, endHz: 10), preparationDelay: 0,
+                  lightDuration: 1, peakTorchLevel: 0.5, fadeIn: 0, fadeOut: 0)
+    }
+
+    func testStepRejectsInvalidCapsWithoutPositiveCommands() throws {
+        for cap in [Float(-0.5), 0, .nan, .infinity] {
+            let hardware = AdversarialTorch()
+            hardware.caps = [cap]
+            let controller = TorchController(device: hardware, clock: { hardware.now },
+                                             notificationCenter: NotificationCenter(), schedulesTimers: false)
+            try controller.start(plan)
+            XCTAssertFalse(controller.isRunning)
+            XCTAssertEqual(controller.lastStopReason, .thermal)
+            XCTAssertTrue(hardware.commands.allSatisfy { $0.level == 0 })
+        }
+    }
+
+    func testStepSamplesCapOnceAndStopsOnSubsequentWithdrawal() throws {
+        let hardware = AdversarialTorch()
+        hardware.caps = [0.08, 0]
+        let controller = TorchController(device: hardware, clock: { hardware.now },
+                                         notificationCenter: NotificationCenter(), schedulesTimers: false)
+        try controller.start(plan)
+        XCTAssertEqual(hardware.commands.last?.level, 0.08)
+        hardware.advance(0.05)
+        controller.step()
+        hardware.advance(0.05)
+        controller.step()
+        XCTAssertEqual(controller.lastStopReason, .thermal)
+        XCTAssertEqual(hardware.commands.map(\.level), [0, 0.08, 0, 0])
+    }
+
+    func testQueuedCompletionFromPriorRunCannotStopRestart() async throws {
+        let hardware = AdversarialTorch()
+        let released = DispatchSemaphore(value: 0)
+        hardware.beforeRelease = { released.signal() }
+        let controller = TorchController(device: hardware, notificationCenter: NotificationCenter())
+        var callbacks = 0
+        controller.onStop = { _ in callbacks += 1 }
+        let short = LightPlan(program: .custom(startHz: 1, endHz: 1), preparationDelay: 0,
+                              lightDuration: 0.02, peakTorchLevel: 0.5, fadeIn: 0, fadeOut: 0)
+        try controller.start(short)
+        // Withhold old main callback until a new generation owns playback.
+        XCTAssertEqual(released.wait(timeout: .now() + 2), .success)
+        let long = LightPlan(program: .custom(startHz: 1, endHz: 1), preparationDelay: 0,
+                             lightDuration: 10, peakTorchLevel: 0.08, fadeIn: 0, fadeOut: 0)
+        try controller.start(long)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(controller.isRunning)
+        XCTAssertEqual(callbacks, 0, "Old queued completion cannot stop or notify the new run")
+        controller.hardStop()
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertEqual(hardware.commands.last?.level, 0)
     }
 }
