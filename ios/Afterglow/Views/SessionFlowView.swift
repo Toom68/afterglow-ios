@@ -17,7 +17,8 @@ struct SessionFlowView: View {
     @State private var intention = ""
     @State private var reflection = ""
     @State private var mood: Mood?
-    @State private var experimentalLight = false
+    @State private var useLight = false
+    @State private var loadedLightPreference = false
     @State private var showingScreening = false
     @State private var confirmEnd = false
     @State private var ownMusic = false
@@ -47,7 +48,7 @@ struct SessionFlowView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        if stage == .listen && experimentalLight { endJourney() }
+                        if stage == .listen && useLight { endJourney() }
                         else if stage == .listen { confirmEnd = true }
                         else { requestClose() }
                     } label: {
@@ -74,7 +75,16 @@ struct SessionFlowView: View {
                 Text("Your unsaved intention or reflection will be lost.")
             }
             .sheet(isPresented: $showingScreening) {
-                LightScreeningView { experimentalLight = true }
+                LightScreeningView {
+                    settings.lightScreenedAt = Date()
+                    settings.lightPreferred = true
+                    useLight = true
+                }
+            }
+            .onAppear {
+                guard !loadedLightPreference else { return }
+                loadedLightPreference = true
+                useLight = lightSelectable && settings.lightPreferred && settings.lightScreeningIsCurrent
             }
             // Subscribe to events rather than view rendering: completion must advance an audio
             // journey while the screen is locked too. Scheduling on main also lets the player
@@ -104,7 +114,7 @@ struct SessionFlowView: View {
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if stage == .listen && experimentalLight {
+                if stage == .listen && useLight {
                     Button(role: .destructive, action: endJourney) {
                         Label("STOP LIGHT & SESSION", systemImage: "stop.fill")
                             .agFont(14, weight: .bold)
@@ -198,38 +208,17 @@ struct SessionFlowView: View {
                         }
                 }
 
-                AfterglowCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Label("Experimental light", systemImage: "flashlight.on.fill")
-                                .agFont(14, weight: .medium)
-                            Spacer()
-                            TagPill(title: experimentalLight ? "OPTED IN" : "OFF", tint: experimentalLight ? AfterglowTheme.gold : AfterglowTheme.muted)
-                        }
-                        Text("Flashing light can trigger seizures and other adverse effects, including in people without a known history. This original prototype sequence is unvalidated and is not Lumenate’s method.")
-                            .agFont(12).foregroundStyle(AfterglowTheme.muted).lineSpacing(4)
-                        if LightFeature.isAvailable && hasTorchHardware && !isJourney && preset.intent != .sleep {
-                            Button(experimentalLight ? "Turn light off" : "Review risks and opt in") {
-                                if experimentalLight { experimentalLight = false } else { showingScreening = true }
-                            }
-                            .agFont(13, weight: .medium).tint(AfterglowTheme.gold)
-                            .frame(minHeight: 44)
-                        } else {
-                            Text(isJourney ? "Journeys are audio only in this prototype." : preset.intent == .sleep ? "Sleep sessions are audio only. Light use requires staying awake and able to stop." : !hasTorchHardware ? "The torch is unavailable on this device or simulator. Use audio only." : LightFeature.statusExplanation)
-                                .agFont(11).foregroundStyle(AfterglowTheme.gold)
-                        }
-                    }
-                }
+                lightCard
 
-                Text(experimentalLight
-                     ? "Stay seated in a clear, quiet space. Keep eyes closed when the torch is facing you. Turn the phone away or cover the torch to interrupt exposure immediately. You can stop the session at any time."
+                Text(useLight
+                     ? "Lie back or sit comfortably with headphones on. Hold the phone a short distance from your face with the torch pointing at your closed eyes. Turn the phone away or cover the torch to interrupt the light at any time."
                      : "Find a comfortable position. You can keep your eyes open or closed, and breathe naturally. There is no particular state to reach.")
                     .agFont(12).foregroundStyle(AfterglowTheme.muted).lineSpacing(4)
-                if experimentalLight {
-                    Text("There is a 10-second positioning delay, then at most 30 seconds of light. Audio continues afterward. Pausing or leaving the app keeps light off for the rest of that session.")
+                if useLight {
+                    Text(lightTimingSummary)
                         .agFont(12).foregroundStyle(AfterglowTheme.gold).lineSpacing(4)
                 }
-                PrimaryButton(title: experimentalLight ? "Begin with experimental light" : "Begin audio session", symbol: "play.fill", action: begin)
+                PrimaryButton(title: useLight ? "Begin with light" : "Begin audio session", symbol: "play.fill", action: begin)
                 Text("\(minutes) MIN  ·  \(soundscape.title.uppercased())  ·  OFFLINE")
                     .agFont(9, design: .monospaced).tracking(1)
                     .foregroundStyle(AfterglowTheme.muted).frame(maxWidth: .infinity)
@@ -244,7 +233,7 @@ struct SessionFlowView: View {
             VStack(spacing: 27) {
                 VStack(spacing: 10) {
                     Text(preset.title).agFont(32, weight: .regular, design: .serif)
-                    Text((ownMusic ? "Your own music" : soundscape.title) + (experimentalLight ? (player.isLightActive ? " · Experimental light test" : " · Light test stopped, audio continues") : " · Audio session"))
+                    Text((ownMusic ? "Your own music" : soundscape.title) + (useLight ? " · With light" : " · Audio session"))
                         .agFont(12).foregroundStyle(AfterglowTheme.muted)
                     if isJourney {
                         Text("JOURNEY  \(sequenceIndex + 1) / \(sequence.count)")
@@ -274,6 +263,9 @@ struct SessionFlowView: View {
                     .agFont(21, weight: .regular, design: .serif)
                     .foregroundStyle(AfterglowTheme.muted).multilineTextAlignment(.center)
                     .frame(minHeight: 65).padding(.horizontal, 20)
+                if useLight && player.phase != .idle {
+                    liveLightControls
+                }
                 if let notice = player.notice {
                     VStack(spacing: 10) {
                         Text(notice.message).agFont(12).lineSpacing(3)
@@ -294,13 +286,13 @@ struct SessionFlowView: View {
                         .frame(width: 76, height: 76).background(AfterglowTheme.gold, in: Circle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(player.phase.isRunning ? (experimentalLight ? "Pause session and stop light" : "Pause session") : (experimentalLight ? "Resume audio only" : "Resume session"))
+                .accessibilityLabel(player.phase.isRunning ? (useLight ? "Pause session and light" : "Pause session") : (useLight ? "Resume session and light" : "Resume session"))
                 }
                 if ownMusic {
                     Text("Pause and stop affect Afterglow’s timer and light. Control your music in its own app.")
                         .agFont(11).foregroundStyle(AfterglowTheme.muted).multilineTextAlignment(.center)
                 }
-                if !experimentalLight {
+                if !useLight {
                     Button("End this moment") { confirmEnd = true }
                         .agFont(13).foregroundStyle(AfterglowTheme.muted)
                         .frame(minHeight: 44)
@@ -365,6 +357,134 @@ struct SessionFlowView: View {
 
     private var accent: Color { AfterglowTheme.accent(for: preset.intent.title) }
 
+    // MARK: - Light
+
+    private var lightSelectable: Bool { LightFeature.isAvailable && hasTorchHardware }
+    private var recommendedProgram: LightProgram { LightProgramCatalog.recommended(for: preset.intent) }
+    private var activeProgram: LightProgram { settings.chosenLightProgram ?? recommendedProgram }
+
+    private var lightToggle: Binding<Bool> {
+        Binding(
+            get: { useLight },
+            set: { on in
+                if on && !settings.lightScreeningIsCurrent {
+                    showingScreening = true
+                } else {
+                    useLight = on
+                    settings.lightPreferred = on
+                }
+            }
+        )
+    }
+
+    private var lightTimingSummary: String {
+        let sleepNote = preset.intent == .sleep || activeProgram.id == LightProgramCatalog.sleep.id
+            ? " Sleep light switches itself off after at most \(Int(LightProgramCatalog.sleepLightLimit / 60)) minutes."
+            : ""
+        return "15 seconds of darkness to settle, then the light fades in over 20 seconds and fades out before the session ends. Pausing turns it off; resuming or returning to Afterglow brings it back after a few dark seconds.\(sleepNote)"
+    }
+
+    private var lightCard: some View {
+        AfterglowCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Flicker light", systemImage: useLight ? "flashlight.on.fill" : "flashlight.off.fill")
+                        .agFont(14, weight: .medium)
+                    Spacer()
+                    if lightSelectable {
+                        Toggle("Flicker light", isOn: lightToggle)
+                            .labelsHidden().tint(AfterglowTheme.gold)
+                    } else {
+                        TagPill(title: "UNAVAILABLE", tint: AfterglowTheme.muted)
+                    }
+                }
+                if !lightSelectable {
+                    Text(LightFeature.isAvailable ? "This device has no usable flashlight (the Simulator never does), so sessions are audio only." : LightFeature.statusExplanation)
+                        .agFont(11).foregroundStyle(AfterglowTheme.gold).lineSpacing(3)
+                } else if useLight {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Program").agFont(12, weight: .medium).foregroundStyle(AfterglowTheme.muted)
+                        Picker("Program", selection: $settings.lightProgramChoice) {
+                            Text("Recommended: \(recommendedProgram.name)").tag(SettingsStore.automaticProgram)
+                            ForEach(LightProgramCatalog.all) { program in
+                                Text("\(program.name) · \(program.rangeDescription)").tag(program.id)
+                            }
+                            Text("Custom").tag(LightProgramCatalog.customID)
+                        }
+                        .pickerStyle(.menu).tint(AfterglowTheme.gold)
+                        Text("\(activeProgram.summary) \(activeProgram.rangeDescription).")
+                            .agFont(12).foregroundStyle(AfterglowTheme.muted).lineSpacing(3)
+                    }
+                    if settings.lightProgramChoice == LightProgramCatalog.customID {
+                        hzSlider("Start", value: $settings.customStartHz)
+                        hzSlider("End", value: $settings.customEndHz)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Brightness").agFont(12, weight: .medium).foregroundStyle(AfterglowTheme.muted)
+                            Spacer()
+                            Text("\(Int((settings.lightBrightness * 100).rounded()))%").agFont(12, design: .monospaced)
+                        }
+                        Slider(value: $settings.lightBrightness, in: SettingsStore.brightnessRange)
+                            .accessibilityLabel("Light brightness")
+                        Text("Start lower on your first sessions. You can change it while the light runs.")
+                            .agFont(11).foregroundStyle(AfterglowTheme.muted)
+                    }
+                    Button("Review safety information") { showingScreening = true }
+                        .agFont(12, weight: .medium).tint(AfterglowTheme.gold).frame(minHeight: 36)
+                } else {
+                    Text("Flashes the flashlight through your closed eyelids in rhythm with the session. Flashing light can trigger seizures, including in people with no known history. A short safety check comes first.")
+                        .agFont(12).foregroundStyle(AfterglowTheme.muted).lineSpacing(4)
+                }
+            }
+        }
+    }
+
+    private func hzSlider(_ title: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("\(title) frequency").agFont(12, weight: .medium).foregroundStyle(AfterglowTheme.muted)
+                Spacer()
+                Text("\(LightProgram.format(value.wrappedValue)) Hz").agFont(12, design: .monospaced)
+            }
+            Slider(value: value, in: LightBounds.standard.frequencyRange, step: 0.5)
+                .accessibilityLabel("\(title) frequency")
+                .accessibilityValue("\(LightProgram.format(value.wrappedValue)) hertz")
+        }
+    }
+
+    private var liveLightStatus: String {
+        if player.lightSuspendedByUser { return "Light off" }
+        if let hz = player.lightFrequency { return "\(player.lightPlan?.program.name ?? "Light") · \(String(format: "%.1f", hz)) Hz" }
+        if player.isLightActive { return "Light starts shortly. Close your eyes." }
+        if !player.phase.isRunning { return "Light paused" }
+        return "Light finished"
+    }
+
+    private var liveLightControls: some View {
+        AfterglowCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label(liveLightStatus, systemImage: player.isLightActive ? "flashlight.on.fill" : "flashlight.off.fill")
+                        .agFont(13, weight: .medium)
+                    Spacer()
+                    Toggle("Light", isOn: Binding(get: { !player.lightSuspendedByUser }, set: { player.setLightEnabled($0) }))
+                        .labelsHidden().tint(AfterglowTheme.gold)
+                }
+                HStack {
+                    Image(systemName: "sun.min").accessibilityHidden(true)
+                    Slider(value: Binding(get: { settings.lightBrightness }, set: { value in
+                        settings.lightBrightness = value
+                        player.setLightBrightness(value)
+                    }), in: SettingsStore.brightnessRange)
+                    .accessibilityLabel("Light brightness")
+                    Image(systemName: "sun.max").accessibilityHidden(true)
+                }
+                .agFont(12).foregroundStyle(AfterglowTheme.muted)
+            }
+        }
+    }
+
     private var guidance: String {
         if player.phase == .idle { return "Your session hasn’t started yet." }
         if !player.phase.isRunning { return "There’s room to pause." }
@@ -390,7 +510,9 @@ struct SessionFlowView: View {
         configuration.soundscape = soundscape
         configuration.volume = ownMusic ? 0 : settings.volume
         configuration.mixWithOtherAudio = ownMusic
-        configuration.useExperimentalLight = experimentalLight
+        configuration.useLight = useLight && lightSelectable && settings.lightScreeningIsCurrent
+        configuration.lightProgram = settings.chosenLightProgram
+        configuration.lightBrightness = settings.lightBrightness
         stage = .listen
         player.start(configuration)
     }
@@ -463,7 +585,7 @@ private struct LightScreeningView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    Eyebrow(text: "Read before every light session")
+                    Eyebrow(text: "Safety check · repeated every 30 days")
                     Text("Flashing light\nhas real risks.")
                         .agFont(34, weight: .regular, design: .serif)
                     Text("It can trigger a seizure even without a known history. Closed eyes, a low brightness setting, or passing this checklist do not make the exposure safe.")
@@ -478,16 +600,16 @@ private struct LightScreeningView: View {
                                 .agFont(12).foregroundStyle(AfterglowTheme.gold).lineSpacing(4)
                         }
                     }
-                    Text("Stay awake and seated in a safe place, with eyes closed while the torch faces you and nobody else exposed to it. Do not use while driving, sleep-deprived, intoxicated, or alone if you have any concern about your response. Stop immediately for discomfort, distress, headache, nausea, twitching, confusion, faintness, or unusual symptoms. Seek urgent medical care for a seizure or loss of consciousness, and medical advice before any further light exposure after a suspected reaction.")
+                    Text("Use it lying down or seated in a safe place, with eyes closed while the torch faces you and nobody else exposed to it. Do not use while driving, sleep-deprived, intoxicated, or alone if you have any concern about your response. Stop immediately for discomfort, distress, headache, nausea, twitching, confusion, faintness, or unusual symptoms. Seek urgent medical care for a seizure or loss of consciousness, and medical advice before any further light exposure after a suspected reaction.")
                         .agFont(13).foregroundStyle(AfterglowTheme.muted).lineSpacing(4)
-                    Text(LightFeature.experimentalDisclosure + "\n\nReview the method report in the source package before testing. The emitted output must be measured without exposing anyone’s eyes first.")
+                    Text(LightFeature.disclosure + "\n\nOn your first session, start the light with the phone pointing away from you to see what it does, and begin with a lower brightness.")
                         .agFont(13).foregroundStyle(AfterglowTheme.gold).lineSpacing(4)
                     Toggle("I am 18 or older", isOn: $adult)
                     Toggle("None of the listed risk factors apply and I am not unsure", isOn: $noRiskFactors)
-                    Toggle("I understand the residual risks and choose this experimental mode for this session", isOn: $understandsRisk)
+                    Toggle("I understand the risks and will stop if I feel unwell", isOn: $understandsRisk)
                     Text("Keep the stop control within reach. Turning the phone away or covering the torch interrupts exposure while you stop the session.")
                         .agFont(12).foregroundStyle(AfterglowTheme.muted).lineSpacing(4)
-                    PrimaryButton(title: "Opt in for this session") {
+                    PrimaryButton(title: "Turn on light") {
                         onOptIn()
                         dismiss()
                     }
@@ -497,7 +619,7 @@ private struct LightScreeningView: View {
                 }
                 .agFont(14).padding(24)
             }
-            .navigationTitle("Experimental light").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Flicker light").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
             .afterglowScreen()
         }

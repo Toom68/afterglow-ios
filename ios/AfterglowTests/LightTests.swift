@@ -23,93 +23,142 @@ final class FakeTorch: TorchDevice {
     }
 }
 
-/// Test-only fixture. These numbers are arbitrary and are NOT proposed light parameters.
-let lightFixture = LightProtocol(
+/// Test fixture: a steady 1 Hz, 50% duty program.
+let fixtureProgram = LightProgram(
     id: "fixture",
-    version: 1,
     name: "Fixture",
-    status: .unvalidatedEngineeringTest(rationale: "unit-test fixture only"),
-    peakTorchLevel: 0.05,
-    preparationDelay: 2,
-    steps: [.init(relativeLevel: 1, duration: 1), .init(relativeLevel: 0, duration: 1)],
-    lightDuration: 10
+    summary: "unit-test fixture",
+    dutyCycle: 0.5,
+    segments: [.init(weight: 1, startHz: 1, endHz: 1)]
 )
 
-final class LightPolicyTests: XCTestCase {
-    func testNothingIsMarkedValidated() {
-        XCTAssertTrue(LightProtocolCatalog.validated.isEmpty)
-        XCTAssertFalse(LightProtocolCatalog.engineeringSmokeTest.status.isValidated)
-        XCTAssertFalse(LightProtocolCatalog.available.contains { $0.status.isValidated })
-    }
+/// 2 s dark, then 10 s of 1 Hz flashes at torch level 0.5, without fades.
+let fixturePlan = LightPlan(program: fixtureProgram, preparationDelay: 2, lightDuration: 10, peakTorchLevel: 0.5, fadeIn: 0, fadeOut: 0)
 
-    func testAvailabilityFollowsBuildFlag() {
-        // Debug (tests) sets AFTERGLOW_LIGHT_RESEARCH; Release never does.
-        XCTAssertEqual(LightFeature.isAvailable, LightFeature.buildAllowsLight)
-        XCTAssertEqual(LightProtocolCatalog.experimental.isEmpty, !LightFeature.buildAllowsLight)
-        if LightFeature.isAvailable {
-            XCTAssertTrue(LightFeature.isExperimentalOnly)
-            XCTAssertEqual(LightFeature.statusExplanation, LightFeature.experimentalDisclosure)
-        } else {
-            XCTAssertEqual(LightFeature.statusExplanation, LightFeature.releaseExplanation)
+final class LightPolicyTests: XCTestCase {
+    func testCatalogProgramsAreWellFormedDistinctAndVaryOverTheSession() {
+        let ids = LightProgramCatalog.all.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count)
+        XCTAssertFalse(ids.contains(LightProgramCatalog.customID))
+        for program in LightProgramCatalog.all {
+            XCTAssertTrue(program.isWellFormed(), program.id)
+            XCTAssertGreaterThan(program.highestHz, program.lowestHz, "\(program.id) should glide between frequencies")
+            XCTAssertTrue(LightBounds.standard.frequencyRange.contains(program.lowestHz))
+            XCTAssertTrue(LightBounds.standard.frequencyRange.contains(program.highestHz))
         }
     }
 
-    func testEngineeringSmokeTestMatchesSpecifiedSettings() {
-        let test = LightProtocolCatalog.engineeringSmokeTest
-        XCTAssertEqual(test.peakTorchLevel, 0.02)
-        XCTAssertEqual(test.preparationDelay, 10)
-        XCTAssertEqual(test.lightDuration, 30)
-        XCTAssertEqual(1 / test.cycleDuration, 3, accuracy: 0.0001, "nominal 3 Hz")
-        let onTime = test.steps.filter { $0.relativeLevel > 0 }.reduce(0) { $0 + $1.duration }
-        XCTAssertEqual(onTime / test.cycleDuration, 0.5, accuracy: 0.0001, "50% duty")
-        XCTAssertTrue(test.isWellFormed(minimumStepDuration: TorchController.minimumStepDuration, levelCeiling: TorchController.brightnessCeiling, maximumLightDuration: TorchController.maximumLightDuration))
+    func testEachIntentHasARecommendedProgram() {
+        XCTAssertEqual(LightProgramCatalog.recommended(for: .calm).id, LightProgramCatalog.relax.id)
+        XCTAssertEqual(LightProgramCatalog.recommended(for: .focus).id, LightProgramCatalog.focus.id)
+        XCTAssertEqual(LightProgramCatalog.recommended(for: .reflect).id, LightProgramCatalog.explore.id)
+        XCTAssertEqual(LightProgramCatalog.recommended(for: .sleep).id, LightProgramCatalog.sleep.id)
+        XCTAssertLessThanOrEqual(LightProgramCatalog.sleep.highestHz, 6, "Sleep stays slow")
     }
 
-    func testLevelsFollowDelayStepsAndEnd() {
-        XCTAssertEqual(lightFixture.relativeLevel(at: 0), 0, "Off during preparation")
-        XCTAssertEqual(lightFixture.relativeLevel(at: 1.9), 0)
-        XCTAssertEqual(lightFixture.relativeLevel(at: 2.0), 1)
-        XCTAssertEqual(lightFixture.relativeLevel(at: 3.5), 0)
-        XCTAssertEqual(lightFixture.relativeLevel(at: 4.2), 1)
-        XCTAssertNil(lightFixture.relativeLevel(at: 12))
-        XCTAssertNil(lightFixture.relativeLevel(at: 99))
+    func testProfileInterpolatesAcrossWeightedSegments() {
+        let program = LightProgram(id: "p", name: "p", summary: "", dutyCycle: 0.5, segments: [
+            .init(weight: 1, startHz: 10, endHz: 8),
+            .init(weight: 3, startHz: 8, endHz: 4, startIntensity: 1, endIntensity: 0.5)
+        ])
+        XCTAssertEqual(program.profile(at: 0).hz, 10, accuracy: 1e-9)
+        XCTAssertEqual(program.profile(at: 0.125).hz, 9, accuracy: 1e-9)
+        XCTAssertEqual(program.profile(at: 0.25).hz, 8, accuracy: 1e-9)
+        XCTAssertEqual(program.profile(at: 1).hz, 4, accuracy: 1e-9)
+        XCTAssertEqual(program.profile(at: 1).intensity, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(program.profile(at: 2).hz, 4, accuracy: 1e-9, "Clamped past the end")
+    }
+
+    func testPlanLevelsFollowDelayPulsesAndEnd() {
+        XCTAssertEqual(fixturePlan.relativeLevel(at: -1), 0)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 0), 0, "Dark during the lead-in")
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 1.9), 0)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 2.0), 1)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 2.4), 1)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 2.5), 0)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 3.2), 1)
+        XCTAssertEqual(fixturePlan.relativeLevel(at: 11.7), 0)
+        XCTAssertNil(fixturePlan.relativeLevel(at: 12))
+        XCTAssertNil(fixturePlan.relativeLevel(at: 99))
     }
 
     func testBoundariesAreAbsoluteAndDriftFree() {
-        XCTAssertEqual(lightFixture.nextBoundary(after: 0), 2)
-        XCTAssertEqual(lightFixture.nextBoundary(after: 2), 3)
-        XCTAssertEqual(lightFixture.nextBoundary(after: 2.999), 3)
-        XCTAssertEqual(lightFixture.nextBoundary(after: 3), 4)
-        XCTAssertEqual(lightFixture.nextBoundary(after: 11.5), 12)
-        XCTAssertNil(lightFixture.nextBoundary(after: 12))
+        XCTAssertEqual(fixturePlan.nextBoundary(after: 0), 2)
+        XCTAssertEqual(fixturePlan.nextBoundary(after: 2), 2.5)
+        XCTAssertEqual(fixturePlan.nextBoundary(after: 2.499), 2.5)
+        XCTAssertEqual(fixturePlan.nextBoundary(after: 2.5), 3)
+        XCTAssertEqual(fixturePlan.nextBoundary(after: 11.6), 12)
+        XCTAssertNil(fixturePlan.nextBoundary(after: 12))
 
-        let smoke = LightProtocolCatalog.engineeringSmokeTest
         var t = 0.0
         var count = 0
-        while let next = smoke.nextBoundary(after: t) {
+        while let next = fixturePlan.nextBoundary(after: t) {
             XCTAssertGreaterThan(next, t)
             t = next
             count += 1
         }
-        XCTAssertEqual(t, 40, accuracy: 1e-6)
-        XCTAssertEqual(count, 1 + 180, "One delay boundary, then 90 on and 90 off edges")
+        XCTAssertEqual(t, 12, accuracy: 1e-6)
+        XCTAssertEqual(count, 21, "10 on and 10 off edges, then the end")
     }
 
-    func testMalformedProtocolsAreRejected() {
-        func wellFormed(_ change: (inout LightProtocol) -> Void) -> Bool {
-            var light = lightFixture
-            change(&light)
-            return light.isWellFormed(minimumStepDuration: 0.1, levelCeiling: 0.2, maximumLightDuration: 60)
+    func testFrequencyGlidesWithinOneSession() {
+        let plan = LightPlan(program: .custom(startHz: 10, endHz: 5), preparationDelay: 0, lightDuration: 60, peakTorchLevel: 1, fadeIn: 0, fadeOut: 0)
+        XCTAssertTrue(plan.isWellFormed())
+        XCTAssertEqual(plan.frequency(at: 0) ?? 0, 10, accuracy: 0.01)
+        XCTAssertEqual(plan.frequency(at: 59.9) ?? 0, 5, accuracy: 0.02)
+        let onsets = plan.edges.filter { $0.level > 0 }.map(\.time)
+        XCTAssertEqual(onsets[1] - onsets[0], 0.1, accuracy: 0.002, "About 10 Hz at the start")
+        XCTAssertEqual(onsets[onsets.count - 1] - onsets[onsets.count - 2], 0.2, accuracy: 0.005, "About 5 Hz at the end")
+        XCTAssertTrue(plan.edges.allSatisfy { $0.time >= 0 && $0.time <= plan.totalDuration })
+        XCTAssertEqual(plan.edges.map(\.time), plan.edges.map(\.time).sorted())
+    }
+
+    func testFadesRampTheLightInAndOut() {
+        let plan = LightPlan(program: .custom(startHz: 10, endHz: 10), preparationDelay: 0, lightDuration: 120, peakTorchLevel: 1, fadeIn: 20, fadeOut: 20)
+        let onsets = plan.edges.filter { $0.level > 0 }
+        XCTAssertEqual(onsets.first?.level ?? 0, 0.15, accuracy: 0.01, "Starts dim")
+        XCTAssertEqual(plan.relativeLevel(at: 60.02) ?? 0, 1, accuracy: 1e-6, "Full in the middle")
+        XCTAssertLessThan(onsets.last?.level ?? 1, 0.2, "Ends dim")
+    }
+
+    func testBoundsRejectUnsafeOrMalformedPrograms() {
+        func valid(_ change: (inout LightProgram) -> Void) -> Bool {
+            var program = fixtureProgram
+            change(&program)
+            return program.isWellFormed()
         }
-        XCTAssertTrue(wellFormed { _ in })
-        XCTAssertFalse(wellFormed { $0.steps = [] })
-        XCTAssertFalse(wellFormed { $0.peakTorchLevel = 0.5 })
-        XCTAssertFalse(wellFormed { $0.peakTorchLevel = .nan })
-        XCTAssertFalse(wellFormed { $0.steps[0].duration = 0.01 })
-        XCTAssertFalse(wellFormed { $0.steps[0].duration = .infinity })
-        XCTAssertFalse(wellFormed { $0.steps[0].relativeLevel = 2 })
-        XCTAssertFalse(wellFormed { $0.lightDuration = 600 })
-        XCTAssertFalse(wellFormed { $0.preparationDelay = -1 })
+        XCTAssertTrue(valid { _ in })
+        XCTAssertFalse(valid { $0.segments = [] })
+        XCTAssertFalse(valid { $0.segments[0].endHz = 20 }, "Above the 15 Hz ceiling")
+        XCTAssertFalse(valid { $0.segments[0].startHz = 0.5 })
+        XCTAssertFalse(valid { $0.segments[0].startHz = .nan })
+        XCTAssertFalse(valid { $0.segments[0].weight = 0 })
+        XCTAssertFalse(valid { $0.segments[0].startIntensity = 2 })
+        XCTAssertFalse(valid { $0.dutyCycle = 0.95 })
+        XCTAssertFalse(valid { $0.dutyCycle = .infinity })
+
+        XCTAssertFalse(LightPlan(program: fixtureProgram, preparationDelay: 0, lightDuration: 10, peakTorchLevel: 1.5).isWellFormed())
+        XCTAssertFalse(LightPlan(program: fixtureProgram, preparationDelay: 0, lightDuration: 10, peakTorchLevel: 0).isWellFormed())
+        XCTAssertFalse(LightPlan(program: fixtureProgram, preparationDelay: 0, lightDuration: 0, peakTorchLevel: 0.5).isWellFormed())
+        XCTAssertFalse(LightPlan(program: .custom(startHz: 30, endHz: 30), preparationDelay: 0, lightDuration: 10, peakTorchLevel: 0.5).isWellFormed())
+        let long = LightPlan(program: fixtureProgram, preparationDelay: 0, lightDuration: 10 * 60 * 60, peakTorchLevel: 0.5)
+        XCTAssertEqual(long.lightDuration, LightBounds.standard.maximumLightDuration, "Clamped to the hard limit")
+    }
+
+    func testHighestFrequencyPulsesStayAboveSchedulingResolution() {
+        let plan = LightPlan(program: LightProgram(id: "fast", name: "fast", summary: "", dutyCycle: 0.2, segments: [.init(weight: 1, startHz: 15, endHz: 15)]), preparationDelay: 0, lightDuration: 5, peakTorchLevel: 1)
+        let gaps = zip(plan.edges.dropFirst(), plan.edges).map { $0.time - $1.time }
+        XCTAssertTrue(gaps.allSatisfy { $0 >= LightBounds.standard.minimumPulse - 1e-9 })
+    }
+
+    func testSessionPlanLeavesLeadInAndOutro() {
+        let plan = LightPlan.forSession(program: LightProgramCatalog.relax, sessionDuration: 600, brightness: 0.6)
+        XCTAssertEqual(plan.preparationDelay, 15)
+        XCTAssertEqual(plan.lightDuration, 600 - 15 - 60, accuracy: 1e-9)
+        XCTAssertEqual(plan.peakTorchLevel, 0.6)
+        XCTAssertTrue(plan.isWellFormed())
+        let sleep = LightPlan.forSession(program: LightProgramCatalog.sleep, sessionDuration: 45 * 60, brightness: 0.6, maximumLight: LightProgramCatalog.sleepLightLimit)
+        XCTAssertEqual(sleep.lightDuration, LightProgramCatalog.sleepLightLimit)
     }
 
     func testScreeningRequiresEveryAnswerAndNoContraindication() {
@@ -121,27 +170,35 @@ final class LightPolicyTests: XCTestCase {
         XCTAssertFalse(screening.isEligible)
     }
 
+    func testScreeningExpires() {
+        let now = Date()
+        XCTAssertFalse(LightScreening.isCurrent(screenedAt: nil, now: now))
+        XCTAssertTrue(LightScreening.isCurrent(screenedAt: now.addingTimeInterval(-86_400), now: now))
+        XCTAssertFalse(LightScreening.isCurrent(screenedAt: now.addingTimeInterval(-31 * 86_400), now: now))
+        XCTAssertFalse(LightScreening.isCurrent(screenedAt: now.addingTimeInterval(86_400), now: now), "A future date is not trusted")
+    }
+
     func testGateOrder() {
-        func gate(build: Bool = true, catalog: [LightProtocol] = [lightFixture], id: String? = nil, screening: Bool = true, consent: Bool = true, thermal: ProcessInfo.ThermalState = .nominal) -> LightUnavailableReason? {
-            if case .failure(let reason) = LightGate.evaluate(buildAllowsLight: build, protocolID: id, catalog: catalog, screeningPassed: screening, consentedThisSession: consent, thermal: thermal) {
+        func gate(build: Bool = true, program: LightProgram? = fixtureProgram, consent: Bool = true, thermal: ProcessInfo.ThermalState = .nominal) -> LightUnavailableReason? {
+            if case .failure(let reason) = LightGate.evaluate(buildAllowsLight: build, program: program, consented: consent, thermal: thermal) {
                 return reason
             }
             return nil
         }
         XCTAssertEqual(gate(build: false), .disabledInThisBuild)
-        XCTAssertEqual(gate(catalog: []), .noProtocolAvailable)
-        XCTAssertEqual(gate(id: "unknown"), .unknownProtocol)
-        XCTAssertEqual(gate(screening: false), .screeningNotPassed)
+        XCTAssertEqual(gate(program: nil), .noProgram)
+        XCTAssertEqual(gate(program: .custom(startHz: 20, endHz: 25)), .invalidProgram)
         XCTAssertEqual(gate(consent: false), .consentMissing)
         XCTAssertEqual(gate(thermal: .serious), .deviceThermalState)
         XCTAssertEqual(gate(thermal: .critical), .deviceThermalState)
         XCTAssertNil(gate())
-        XCTAssertNil(gate(id: "fixture", thermal: .fair))
+        XCTAssertNil(gate(thermal: .fair))
     }
 
-    func testReleaseBuildGateRefuses() {
-        let result = LightGate.evaluate(buildAllowsLight: false, protocolID: nil, catalog: [LightProtocolCatalog.engineeringSmokeTest], screeningPassed: true, consentedThisSession: true, thermal: .nominal)
-        XCTAssertEqual(result, .failure(.disabledInThisBuild))
+    func testAvailabilityFollowsBuildFlag() {
+        // Debug (tests) sets AFTERGLOW_LIGHT_RESEARCH; Release never does.
+        XCTAssertEqual(LightFeature.isAvailable, LightFeature.buildAllowsLight)
+        XCTAssertEqual(LightFeature.statusExplanation, LightFeature.isAvailable ? LightFeature.disclosure : LightFeature.releaseExplanation)
     }
 }
 
@@ -151,7 +208,6 @@ final class TorchControllerTests: XCTestCase {
     private var thermal: ProcessInfo.ThermalState = .nominal
     private var torch: FakeTorch!
     private var controller: TorchController!
-    private let catalog = [lightFixture]
 
     override func setUp() async throws {
         now = 0
@@ -176,54 +232,83 @@ final class TorchControllerTests: XCTestCase {
         controller.step()
     }
 
-    func testRejectsProtocolsOutsideAllowedCatalog() {
-        XCTAssertThrowsError(try controller.start(lightFixture, allowedCatalog: [])) { error in
+    func testRejectsMalformedPlans() {
+        let bad = LightPlan(program: .custom(startHz: 30, endHz: 30), preparationDelay: 0, lightDuration: 10, peakTorchLevel: 0.5)
+        XCTAssertThrowsError(try controller.start(bad)) { error in
             XCTAssertEqual(error as? TorchError, .protocolRejected)
         }
         XCTAssertFalse(controller.isRunning)
         XCTAssertEqual(torch.current, 0)
     }
 
-    func testStaysOffDuringPreparationThenUsesProtocolPeak() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+    func testStaysOffDuringPreparationThenUsesPlanBrightness() throws {
+        try controller.start(fixturePlan)
         XCTAssertEqual(torch.current, 0)
         advance(to: 1.5)
         XCTAssertEqual(torch.current, 0)
         advance(to: 2.0)
-        XCTAssertEqual(torch.current, 0.05, accuracy: 0.0001)
-        advance(to: 3.0)
+        XCTAssertEqual(torch.current, 0.5, accuracy: 0.0001)
+        advance(to: 2.5)
         XCTAssertEqual(torch.current, 0)
-        XCTAssertTrue(torch.levels.allSatisfy { $0 <= lightFixture.peakTorchLevel })
+        XCTAssertTrue(torch.levels.allSatisfy { $0 <= fixturePlan.peakTorchLevel })
     }
 
     func testFollowsLowerSystemLimitButNeverCompensatesUpward() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         torch.maxAvailableLevel = 0.01
         advance(to: 2.0)
         XCTAssertEqual(torch.current, 0.01, accuracy: 0.0001)
-        XCTAssertTrue(torch.levels.allSatisfy { $0 <= TorchController.brightnessCeiling })
+    }
+
+    func testBrightnessCanChangeWhileRunning() throws {
+        try controller.start(fixturePlan)
+        advance(to: 2.0)
+        XCTAssertEqual(torch.current, 0.5, accuracy: 0.0001)
+        controller.setPeakLevel(0.2)
+        advance(to: 2.5)
+        advance(to: 3.0)
+        XCTAssertEqual(torch.current, 0.2, accuracy: 0.0001)
+        controller.setPeakLevel(5)
+        advance(to: 3.5)
+        advance(to: 4.0)
+        XCTAssertEqual(torch.current, 1, accuracy: 0.0001, "Never above the hardware ceiling")
+    }
+
+    func testResumeHoldsDarkThenContinuesFromTheSessionPoint() throws {
+        try controller.start(fixturePlan, at: 5.2, holdOff: 3)
+        XCTAssertEqual(torch.current, 0)
+        advance(to: 2.9)
+        XCTAssertEqual(torch.current, 0, "Still in the dark hold")
+        advance(to: 3.01)
+        XCTAssertEqual(torch.current, 0.5, accuracy: 0.0001, "5.21 s into the plan is an on phase")
+        XCTAssertEqual(controller.planElapsed ?? 0, 5.21, accuracy: 1e-9)
+    }
+
+    func testRefusesToStartAfterThePlanEnded() {
+        XCTAssertThrowsError(try controller.start(fixturePlan, at: 12))
+        XCTAssertFalse(controller.isRunning)
     }
 
     func testFinishesAndTurnsOff() throws {
         var reasons: [TorchStopReason] = []
         controller.onStop = { reasons.append($0) }
-        try controller.start(lightFixture, allowedCatalog: catalog)
-        advance(to: 2.5)
+        try controller.start(fixturePlan)
+        advance(to: 2.2)
         advance(to: 12)
         XCTAssertFalse(controller.isRunning)
         XCTAssertEqual(torch.current, 0)
         XCTAssertEqual(reasons, [.finished])
     }
 
-    func testHardTimeoutOverridesProtocol() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+    func testHardTimeoutOverridesPlan() throws {
+        try controller.start(fixturePlan)
         advance(to: TorchController.hardTimeout)
         XCTAssertFalse(controller.isRunning)
         XCTAssertEqual(controller.lastStopReason, .timeout)
     }
 
     func testHardStopIsImmediateIdempotentAndFinal() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         advance(to: 2.1)
         XCTAssertGreaterThan(torch.current, 0)
         controller.hardStop()
@@ -236,11 +321,11 @@ final class TorchControllerTests: XCTestCase {
 
     func testConfigurationErrorsLeaveTorchOff() throws {
         torch.hasTorch = false
-        XCTAssertThrowsError(try controller.start(lightFixture, allowedCatalog: catalog)) { error in
+        XCTAssertThrowsError(try controller.start(fixturePlan)) { error in
             XCTAssertEqual(error as? TorchError, .noTorch)
         }
         torch.hasTorch = true
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         torch.failNextOn = true
         advance(to: 2.0)
         XCTAssertFalse(controller.isRunning)
@@ -250,13 +335,13 @@ final class TorchControllerTests: XCTestCase {
 
     func testRefusesToStartWhenWarm() {
         thermal = .serious
-        XCTAssertThrowsError(try controller.start(lightFixture, allowedCatalog: catalog)) { error in
+        XCTAssertThrowsError(try controller.start(fixturePlan)) { error in
             XCTAssertEqual(error as? TorchError, .thermal)
         }
     }
 
     func testThermalRiseStops() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         advance(to: 2.0)
         thermal = .serious
         advance(to: 2.5)
@@ -265,14 +350,14 @@ final class TorchControllerTests: XCTestCase {
     }
 
     func testTorchBecomingUnavailableStops() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         torch.isTorchAvailable = false
         advance(to: 2.0)
         XCTAssertEqual(controller.lastStopReason, .failure(.torchUnavailable))
     }
 
     func testFailedOffCommandIsReportedNotHidden() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         advance(to: 2.0)
         torch.failOff = true
         controller.hardStop()
@@ -287,16 +372,16 @@ final class TorchControllerTests: XCTestCase {
 
     func testRefusesToStartIfTorchCannotBeTurnedOff() {
         torch.failOff = true
-        XCTAssertThrowsError(try controller.start(lightFixture, allowedCatalog: catalog))
+        XCTAssertThrowsError(try controller.start(fixturePlan))
         XCTAssertFalse(controller.isRunning)
         XCTAssertTrue(torch.levels.isEmpty, "Never turned on")
     }
 
     func testSystemLimitOfZeroStops() throws {
-        try controller.start(lightFixture, allowedCatalog: catalog)
+        try controller.start(fixturePlan)
         advance(to: 2.0)
         torch.maxAvailableLevel = 0
-        advance(to: 4.0)
+        advance(to: 3.0)
         XCTAssertEqual(controller.lastStopReason, .thermal)
         XCTAssertEqual(torch.current, 0)
     }

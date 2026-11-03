@@ -1,131 +1,295 @@
 import Foundation
 
-/// A versioned torch sequence. Afterglow does not claim that any set of light parameters is
-/// safe or effective. A protocol is either `validated` (reviewed and cited; none exist today) or
-/// an `unvalidatedEngineeringTest` used only to exercise the hardware path in development builds.
-struct LightProtocol: Identifiable, Codable, Hashable {
-    enum Status: Codable, Hashable {
-        /// Passed scientific/safety review and optical measurement. `reference` cites the record.
-        case validated(reference: String)
-        /// Arbitrary engineering numbers for exercising code on a device. NOT a safe dose,
-        /// NOT an efficacy protocol, NOT derived from or validated by any study.
-        case unvalidatedEngineeringTest(rationale: String)
-
-        var isValidated: Bool {
-            if case .validated = self { return true }
-            return false
-        }
-    }
-
-    struct Step: Codable, Hashable {
-        /// Fraction of `peakTorchLevel`, 0...1. 0 means torch off.
-        var relativeLevel: Float
-        var duration: TimeInterval
+/// A flicker program: an ordered set of segments whose flash frequency glides linearly from
+/// `startHz` to `endHz`. Segment `weight`s are shares of the light part of a session, so the
+/// same program stretches to any session length. Intensities are fractions of the user's
+/// brightness setting. No program here is a clinically validated dose.
+struct LightProgram: Identifiable, Codable, Hashable {
+    struct Segment: Codable, Hashable {
+        var weight: Double
+        var startHz: Double
+        var endHz: Double
+        var startIntensity: Double = 1
+        var endIntensity: Double = 1
     }
 
     var id: String
-    var version: Int
     var name: String
-    var status: Status
-    /// Absolute `AVCaptureDevice` torch level requested at relative level 1, before the
-    /// controller's engineering ceiling and the system's thermal limit are applied.
-    var peakTorchLevel: Float
-    /// Torch stays off for this long after the session starts.
-    var preparationDelay: TimeInterval
-    /// Steps repeat in order for `lightDuration` seconds after the delay, then light ends.
-    var steps: [Step]
-    var lightDuration: TimeInterval
+    var summary: String
+    /// Share of each flash cycle the torch is on.
+    var dutyCycle: Double
+    var segments: [Segment]
 
-    var cycleDuration: TimeInterval { steps.reduce(0) { $0 + $1.duration } }
+    var lowestHz: Double { segments.flatMap { [$0.startHz, $0.endHz] }.min() ?? 0 }
+    var highestHz: Double { segments.flatMap { [$0.startHz, $0.endHz] }.max() ?? 0 }
+
+    var rangeDescription: String {
+        let low = Self.format(lowestHz), high = Self.format(highestHz)
+        return low == high ? "\(low) Hz" : "\(low)–\(high) Hz"
+    }
+
+    static func format(_ hz: Double) -> String {
+        hz.rounded() == hz ? String(Int(hz)) : String(format: "%.1f", hz)
+    }
+
+    func isWellFormed(bounds: LightBounds = .standard) -> Bool {
+        guard !segments.isEmpty, dutyCycle.isFinite, bounds.dutyRange.contains(dutyCycle) else { return false }
+        return segments.allSatisfy {
+            $0.weight.isFinite && $0.weight > 0
+                && bounds.frequencyRange.contains($0.startHz) && bounds.frequencyRange.contains($0.endHz)
+                && (0...1).contains($0.startIntensity) && (0...1).contains($0.endIntensity)
+        }
+    }
+
+    /// Frequency and relative intensity `fraction` (0...1) of the way through the light.
+    func profile(at fraction: Double) -> (hz: Double, intensity: Double) {
+        let total = segments.reduce(0) { $0 + $1.weight }
+        guard total > 0, let last = segments.last else { return (0, 0) }
+        var start = 0.0
+        let target = min(max(fraction, 0), 1) * total
+        for (index, segment) in segments.enumerated() {
+            let end = start + segment.weight
+            if target < end || index == segments.count - 1 {
+                let p = min(max((target - start) / segment.weight, 0), 1)
+                return (segment.startHz + (segment.endHz - segment.startHz) * p,
+                        segment.startIntensity + (segment.endIntensity - segment.startIntensity) * p)
+            }
+            start = end
+        }
+        return (last.endHz, last.endIntensity)
+    }
+
+    /// A user-defined glide between two frequencies.
+    static func custom(startHz: Double, endHz: Double, dutyCycle: Double = 0.5) -> LightProgram {
+        LightProgram(
+            id: LightProgramCatalog.customID,
+            name: "Custom",
+            summary: "Your own glide from \(format(startHz)) to \(format(endHz)) Hz.",
+            dutyCycle: dutyCycle,
+            segments: [Segment(weight: 1, startHz: startHz, endHz: endHz)]
+        )
+    }
+}
+
+/// Hard global limits every program and plan must respect, whatever its source.
+struct LightBounds: Hashable {
+    /// Flashes per second. Photosensitive responses are most often reported around 15–25 Hz,
+    /// so the ceiling stays below that band.
+    var frequencyRange: ClosedRange<Double>
+    var dutyRange: ClosedRange<Double>
+    /// Shortest on or off pulse accepted (main-queue scheduling resolution).
+    var minimumPulse: TimeInterval
+    var maximumLightDuration: TimeInterval
+    var brightnessCeiling: Float
+
+    static let standard = LightBounds(
+        frequencyRange: 1...15,
+        dutyRange: 0.2...0.7,
+        minimumPulse: 0.012,
+        maximumLightDuration: 60 * 60,
+        brightnessCeiling: 1
+    )
+}
+
+/// A program rendered for one session: absolute on/off edges from session start.
+struct LightPlan {
+    struct Edge: Hashable {
+        /// Seconds from session start.
+        var time: TimeInterval
+        /// Fraction of `peakTorchLevel`, 0 means torch off.
+        var level: Float
+    }
+
+    let program: LightProgram
+    let preparationDelay: TimeInterval
+    let lightDuration: TimeInterval
+    /// Requested `AVCaptureDevice` torch level at relative level 1 (the brightness setting).
+    let peakTorchLevel: Float
+    let fadeIn: TimeInterval
+    let fadeOut: TimeInterval
+    let edges: [Edge]
+
     var totalDuration: TimeInterval { preparationDelay + lightDuration }
 
-    /// Rejects malformed, non-finite or out-of-range data before anything reaches the torch.
-    func isWellFormed(minimumStepDuration: TimeInterval, levelCeiling: Float, maximumLightDuration: TimeInterval) -> Bool {
-        guard !steps.isEmpty,
-              peakTorchLevel.isFinite, peakTorchLevel > 0, peakTorchLevel <= levelCeiling,
-              preparationDelay.isFinite, preparationDelay >= 0,
-              lightDuration.isFinite, lightDuration > 0, lightDuration <= maximumLightDuration
-        else { return false }
-        return steps.allSatisfy {
-            $0.duration.isFinite && $0.duration >= minimumStepDuration
-                && $0.relativeLevel.isFinite && (0...1).contains($0.relativeLevel)
-        }
-    }
-
-    /// Relative level `elapsed` seconds after start; nil once the sequence has finished.
-    func relativeLevel(at elapsed: TimeInterval) -> Float? {
-        guard let located = locate(elapsed) else { return elapsed < preparationDelay && elapsed >= 0 ? 0 : nil }
-        return min(max(steps[located.index].relativeLevel, 0), 1)
-    }
-
-    /// The next instant (seconds from start) at which the level changes or the sequence ends.
-    /// Computed from the absolute start, so scheduling never accumulates drift.
-    func nextBoundary(after elapsed: TimeInterval) -> TimeInterval? {
-        guard elapsed < totalDuration - Self.tolerance else { return nil }
-        if elapsed < preparationDelay { return preparationDelay }
-        guard let located = locate(elapsed) else { return nil }
-        return min(located.end, totalDuration)
-    }
-
-    /// Absorbs floating-point error so an instant computed as a boundary is never treated as
-    /// just before it (which would repeat a step or schedule a zero-length one).
     private static let tolerance: TimeInterval = 1e-9
 
-    /// Index of the step active at `elapsed` and the absolute time that step ends.
-    private func locate(_ elapsed: TimeInterval) -> (index: Int, end: TimeInterval)? {
-        guard elapsed >= preparationDelay, elapsed < totalDuration - Self.tolerance, cycleDuration > 0 else { return nil }
-        let intoLight = elapsed - preparationDelay
-        let cycles = (intoLight / cycleDuration).rounded(.down)
-        var stepEnd = preparationDelay + cycles * cycleDuration
-        for (index, step) in steps.enumerated() {
-            stepEnd += step.duration
-            if elapsed < stepEnd - Self.tolerance { return (index: index, end: stepEnd) }
+    init(program: LightProgram, preparationDelay: TimeInterval, lightDuration: TimeInterval, peakTorchLevel: Float, fadeIn: TimeInterval = 20, fadeOut: TimeInterval = 20, bounds: LightBounds = .standard) {
+        self.program = program
+        self.preparationDelay = max(0, preparationDelay)
+        self.lightDuration = max(0, min(lightDuration, bounds.maximumLightDuration))
+        self.peakTorchLevel = peakTorchLevel
+        self.fadeIn = max(0, fadeIn)
+        self.fadeOut = max(0, fadeOut)
+        edges = Self.render(program: program, delay: self.preparationDelay, duration: self.lightDuration, fadeIn: self.fadeIn, fadeOut: self.fadeOut, bounds: bounds)
+    }
+
+    /// Builds a plan for a session of `sessionDuration`: a lead-in in darkness, light, then a
+    /// quiet outro so the session ends without flicker.
+    static func forSession(program: LightProgram, sessionDuration: TimeInterval, brightness: Float, leadIn: TimeInterval = 15, maximumLight: TimeInterval? = nil, bounds: LightBounds = .standard) -> LightPlan {
+        let outro = min(90, sessionDuration * 0.1)
+        var light = sessionDuration - leadIn - outro
+        if let maximumLight { light = min(light, maximumLight) }
+        return LightPlan(program: program, preparationDelay: leadIn, lightDuration: max(light, 0), peakTorchLevel: brightness, bounds: bounds)
+    }
+
+    func isWellFormed(bounds: LightBounds = .standard) -> Bool {
+        guard program.isWellFormed(bounds: bounds),
+              peakTorchLevel.isFinite, peakTorchLevel > 0, peakTorchLevel <= bounds.brightnessCeiling,
+              preparationDelay.isFinite, lightDuration.isFinite,
+              lightDuration > 0, lightDuration <= bounds.maximumLightDuration,
+              !edges.isEmpty
+        else { return false }
+        return edges.allSatisfy { $0.level.isFinite && (0...1).contains($0.level) }
+    }
+
+    /// Relative level `elapsed` seconds after session start; nil once the light has finished.
+    func relativeLevel(at elapsed: TimeInterval) -> Float? {
+        guard elapsed < totalDuration - Self.tolerance else { return nil }
+        guard let index = lastEdgeIndex(atOrBefore: elapsed) else { return 0 }
+        return edges[index].level
+    }
+
+    /// The next instant at which the level changes or the light ends. Drift-free: computed
+    /// from absolute edge times, never by accumulating delays.
+    func nextBoundary(after elapsed: TimeInterval) -> TimeInterval? {
+        guard elapsed < totalDuration - Self.tolerance else { return nil }
+        let next = (lastEdgeIndex(atOrBefore: elapsed).map { $0 + 1 }) ?? 0
+        return next < edges.count ? min(edges[next].time, totalDuration) : totalDuration
+    }
+
+    /// Nominal flash frequency at `elapsed`, or nil outside the light.
+    func frequency(at elapsed: TimeInterval) -> Double? {
+        guard lightDuration > 0, elapsed >= preparationDelay, elapsed < totalDuration else { return nil }
+        return program.profile(at: (elapsed - preparationDelay) / lightDuration).hz
+    }
+
+    private func lastEdgeIndex(atOrBefore elapsed: TimeInterval) -> Int? {
+        var low = 0, high = edges.count - 1, found: Int?
+        while low <= high {
+            let mid = (low + high) / 2
+            if edges[mid].time <= elapsed + Self.tolerance {
+                found = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
         }
-        return (index: 0, end: stepEnd + steps[0].duration)
+        return found
+    }
+
+    private static func render(program: LightProgram, delay: TimeInterval, duration: TimeInterval, fadeIn: TimeInterval, fadeOut: TimeInterval, bounds: LightBounds) -> [Edge] {
+        guard duration > 0, program.isWellFormed(bounds: bounds) else { return [] }
+        var edges: [Edge] = []
+        var t = 0.0
+        while duration - t >= bounds.minimumPulse {
+            let profile = program.profile(at: t / duration)
+            let hz = min(max(profile.hz, bounds.frequencyRange.lowerBound), bounds.frequencyRange.upperBound)
+            let period = 1 / hz
+            let on = max(period * program.dutyCycle, bounds.minimumPulse)
+            let rampIn = fadeIn > 0 ? min(1, t / fadeIn) : 1
+            let rampOut = fadeOut > 0 ? min(1, (duration - t) / fadeOut) : 1
+            let envelope = 0.15 + 0.85 * min(rampIn, rampOut)
+            let level = Float(min(max(profile.intensity * envelope, 0), 1))
+            if level > 0 {
+                edges.append(Edge(time: delay + t, level: level))
+                if t + on < duration { edges.append(Edge(time: delay + t + on, level: 0)) }
+            }
+            t += period
+        }
+        return edges
     }
 }
 
-enum LightProtocolCatalog {
-    /// Protocols that passed scientific, safety and optical review. Intentionally empty: no
-    /// validated protocol exists (see docs/research/science-and-safety.md). Never move the
-    /// engineering test below into this list.
-    static let validated: [LightProtocol] = []
+enum LightProgramCatalog {
+    static let customID = "custom"
 
-    /// Development-only sequence for exercising the torch path on a physical device. These
-    /// numbers were specified by the project coordinator as arbitrary engineering test settings:
-    /// nominal 3 Hz, 50% duty, requested torch level 0.02, 30 s of light after a 10 s delay.
-    /// They are NOT a safe dose, NOT an efficacy protocol, and NOT taken from any study.
-    /// Requested timing is scheduled on the main thread; actual emitted timing is unmeasured.
-    static let engineeringSmokeTest = LightProtocol(
-        id: "engineering-smoke-test",
-        version: 1,
-        name: "Engineering smoke test (unvalidated)",
-        status: .unvalidatedEngineeringTest(rationale: "Coordinator-specified arbitrary hardware test values; not reviewed, measured, or validated."),
-        peakTorchLevel: 0.02,
-        preparationDelay: 10,
-        steps: [
-            LightProtocol.Step(relativeLevel: 1, duration: 1.0 / 6.0),
-            LightProtocol.Step(relativeLevel: 0, duration: 1.0 / 6.0)
-        ],
-        lightDuration: 30
+    static let relax = LightProgram(
+        id: "relax",
+        name: "Unwind",
+        summary: "Starts in alpha around 10 Hz and slowly settles toward 6 Hz, then lifts gently at the end.",
+        dutyCycle: 0.5,
+        segments: [
+            .init(weight: 1, startHz: 10, endHz: 9),
+            .init(weight: 3, startHz: 9, endHz: 7),
+            .init(weight: 3, startHz: 7, endHz: 6),
+            .init(weight: 2, startHz: 6, endHz: 8),
+            .init(weight: 1, startHz: 8, endHz: 10)
+        ]
     )
 
-    /// Unvalidated sequences that research builds may run. Empty unless compiled for research.
-    static var experimental: [LightProtocol] {
-        LightFeature.buildAllowsLight ? [engineeringSmokeTest] : []
+    static let focus = LightProgram(
+        id: "focus",
+        name: "Steady",
+        summary: "Holds a steady 10–12 Hz alpha rhythm for clear, settled attention.",
+        dutyCycle: 0.5,
+        segments: [
+            .init(weight: 1, startHz: 12, endHz: 10),
+            .init(weight: 6, startHz: 10, endHz: 10),
+            .init(weight: 2, startHz: 10, endHz: 11),
+            .init(weight: 1, startHz: 11, endHz: 10)
+        ]
+    )
+
+    static let explore = LightProgram(
+        id: "explore",
+        name: "Explore",
+        summary: "Builds to vivid 10–12 Hz flicker, where imagery tends to be strongest, then eases down.",
+        dutyCycle: 0.4,
+        segments: [
+            .init(weight: 1, startHz: 8, endHz: 10),
+            .init(weight: 2, startHz: 10, endHz: 12),
+            .init(weight: 2, startHz: 12, endHz: 10),
+            .init(weight: 3, startHz: 10, endHz: 10),
+            .init(weight: 2, startHz: 10, endHz: 7)
+        ]
+    )
+
+    static let deep = LightProgram(
+        id: "deep",
+        name: "Deep",
+        summary: "Descends from 8 Hz into slow 4–5 Hz theta flicker and back up.",
+        dutyCycle: 0.5,
+        segments: [
+            .init(weight: 2, startHz: 8, endHz: 6),
+            .init(weight: 3, startHz: 6, endHz: 4.5),
+            .init(weight: 3, startHz: 4.5, endHz: 6),
+            .init(weight: 2, startHz: 6, endHz: 8)
+        ]
+    )
+
+    static let sleep = LightProgram(
+        id: "sleep",
+        name: "Drift off",
+        summary: "Slows from 6 Hz to around 3 Hz and dims as it goes, then switches itself off.",
+        dutyCycle: 0.5,
+        segments: [
+            .init(weight: 2, startHz: 6, endHz: 4, startIntensity: 1, endIntensity: 0.8),
+            .init(weight: 5, startHz: 4, endHz: 3, startIntensity: 0.8, endIntensity: 0.5),
+            .init(weight: 3, startHz: 3, endHz: 2, startIntensity: 0.5, endIntensity: 0.25)
+        ]
+    )
+
+    static let all: [LightProgram] = [relax, focus, explore, deep, sleep]
+
+    static func program(id: String) -> LightProgram? {
+        all.first { $0.id == id }
     }
 
-    /// Everything the current build may run.
-    static var available: [LightProtocol] { validated + experimental }
-
-    static func availableProtocol(id: String) -> LightProtocol? {
-        available.first { $0.id == id }
+    static func recommended(for intent: SessionIntent) -> LightProgram {
+        switch intent {
+        case .calm: return relax
+        case .focus: return focus
+        case .reflect: return explore
+        case .sleep: return sleep
+        }
     }
+
+    /// Sleep light switches itself off after this long so nobody is flickered while asleep.
+    static let sleepLightLimit: TimeInterval = 20 * 60
 }
 
-/// Optional model of a contraindication checklist. Answering "yes" to any question blocks light.
-/// Passing it does NOT make light safe; it only excludes people known to be at higher risk. The
-/// UI's own screening sheet is authoritative and must be completed before every light session.
+/// Contraindication checklist. Answering "yes" to any question blocks light. Passing it does
+/// not make light safe; it only excludes people known to be at higher risk.
 struct LightScreening: Codable, Hashable {
     enum Question: String, Codable, CaseIterable, Identifiable {
         case seizureHistory
@@ -161,33 +325,42 @@ struct LightScreening: Codable, Hashable {
     var isComplete: Bool { Question.allCases.allSatisfy { answers[$0] != nil } }
     var hasContraindication: Bool { answers.values.contains(true) }
     var isEligible: Bool { isComplete && !hasContraindication }
+
+    /// How long a completed safety check is remembered before it must be repeated.
+    static let validity: TimeInterval = 30 * 24 * 60 * 60
+
+    static func isCurrent(screenedAt: Date?, now: Date = Date()) -> Bool {
+        guard let screenedAt else { return false }
+        return now.timeIntervalSince(screenedAt) < validity && screenedAt <= now
+    }
 }
 
 enum LightUnavailableReason: Error, Hashable {
     case disabledInThisBuild
-    case noProtocolAvailable
-    case unknownProtocol
-    case screeningNotPassed
+    case noProgram
+    case invalidProgram
     case consentMissing
     case deviceThermalState
     case sessionNotRunning
-    case alreadyUsedThisSession
+    case stoppedThisSession
     /// A previous off request failed and the user has not yet confirmed the torch is off.
     case shutdownUnconfirmed
     case hardware(TorchError)
 
     var message: String {
         switch self {
-        case .disabledInThisBuild, .noProtocolAvailable, .unknownProtocol:
-            return "Light mode isn't available in this version, so this session is audio only."
-        case .screeningNotPassed, .consentMissing:
-            return "Light needs this session's safety check and consent, so this session is audio only."
+        case .disabledInThisBuild:
+            return "Light isn't available in this build, so this session is audio only."
+        case .noProgram, .invalidProgram:
+            return "That light program can't run, so this session is audio only."
+        case .consentMissing:
+            return "Light needs the safety check first, so this session is audio only."
         case .deviceThermalState:
-            return "Your device is warm, so light stays off for this session."
+            return "Your device is warm, so light stays off for now."
         case .sessionNotRunning:
             return "Light can only start with a running session."
-        case .alreadyUsedThisSession:
-            return "Light already ran in this session. Start a new session to use it again."
+        case .stoppedThisSession:
+            return "Light stopped earlier in this session, so it stays off until a new session."
         case .shutdownUnconfirmed:
             return "Light is blocked until you confirm the flashlight from an earlier session is off."
         case .hardware(let error):
@@ -196,31 +369,28 @@ enum LightUnavailableReason: Error, Hashable {
     }
 }
 
-/// Pure gate deciding whether a light run may begin. Light is per-session opt-in: screening
-/// and consent are never remembered between sessions.
+/// Pure gate deciding whether a light run may begin.
 enum LightGate {
     static func evaluate(
         buildAllowsLight: Bool = LightFeature.buildAllowsLight,
-        protocolID: String?,
-        catalog: [LightProtocol] = LightProtocolCatalog.available,
-        screeningPassed: Bool,
-        consentedThisSession: Bool,
-        thermal: ProcessInfo.ThermalState
-    ) -> Result<LightProtocol, LightUnavailableReason> {
+        program: LightProgram?,
+        consented: Bool,
+        thermal: ProcessInfo.ThermalState,
+        bounds: LightBounds = .standard
+    ) -> Result<LightProgram, LightUnavailableReason> {
         guard buildAllowsLight else { return .failure(.disabledInThisBuild) }
-        guard let first = catalog.first else { return .failure(.noProtocolAvailable) }
-        let wanted = protocolID ?? first.id
-        guard let light = catalog.first(where: { $0.id == wanted }) else { return .failure(.unknownProtocol) }
-        guard screeningPassed else { return .failure(.screeningNotPassed) }
-        guard consentedThisSession else { return .failure(.consentMissing) }
+        guard let program else { return .failure(.noProgram) }
+        guard program.isWellFormed(bounds: bounds) else { return .failure(.invalidProgram) }
+        guard consented else { return .failure(.consentMissing) }
         guard thermal == .nominal || thermal == .fair else { return .failure(.deviceThermalState) }
-        return .success(light)
+        return .success(program)
     }
 }
 
 enum LightFeature {
     /// Compile-time switch. Only builds compiled with `AFTERGLOW_LIGHT_RESEARCH` (the project sets
-    /// it for the Debug configuration only) can run light. Release/Archive builds never can.
+    /// it for the Debug configuration, which Xcode uses when you press Run) can run light.
+    /// Release/Archive builds never can.
     static var buildAllowsLight: Bool {
         #if AFTERGLOW_LIGHT_RESEARCH
         return true
@@ -229,36 +399,27 @@ enum LightFeature {
         #endif
     }
 
-    /// What Views should check before offering any light option.
-    static var isAvailable: Bool {
-        buildAllowsLight && !LightProtocolCatalog.available.isEmpty
-    }
-
-    /// True when the only light on offer is unvalidated. Views must say so wherever it is offered.
-    static var isExperimentalOnly: Bool {
-        isAvailable && !LightProtocolCatalog.available.contains { $0.status.isValidated }
-    }
+    static var isAvailable: Bool { buildAllowsLight }
 
     static var statusTitle: String {
-        isAvailable ? "Experimental light (development build)" : "Light mode is not available"
+        isAvailable ? "Flicker light" : "Light mode is not available"
     }
 
     static var statusExplanation: String {
-        isAvailable ? experimentalDisclosure : releaseExplanation
+        isAvailable ? disclosure : releaseExplanation
     }
 
     static let releaseExplanation = """
-    Afterglow is audio-only in this build. We have not found a validated protocol for flashing \
-    phone-torch light, and the device output has not been measured, so light is switched off. \
-    Flashing light can trigger seizures, including in people with no known history.
+    Afterglow is audio-only in this build. Light is enabled only in development builds \
+    installed from Xcode. Flashing light can trigger seizures, including in people with no \
+    known history.
     """
 
-    static let experimentalDisclosure = """
-    This development build includes an unvalidated engineering test of the phone torch: nominal \
-    3 Hz flashing, 50% duty, a requested torch level of 0.02, and at most 30 seconds of light \
-    after a 10-second delay. These are arbitrary test settings, not a safe dose or a treatment, \
-    and they are not taken from any study. Actual emitted timing and brightness have not been \
-    measured. Check the output with the torch pointed away from everyone's eyes before any use. \
-    Flashing light can trigger seizures, including in people with no known history.
+    static let disclosure = """
+    Light mode flashes the phone's flashlight through your closed eyelids at 1–15 Hz, gliding \
+    between frequencies over the session, with a dark lead-in and a fade in and out. These \
+    programs are original designs informed by published flicker research; they are not \
+    Lumenate's sequences and not a validated or medical treatment. Flashing light can trigger \
+    seizures, including in people with no known history.
     """
 }

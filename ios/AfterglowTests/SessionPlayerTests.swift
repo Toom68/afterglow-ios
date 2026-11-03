@@ -244,6 +244,10 @@ final class SessionPlayerTests: XCTestCase {
         XCTAssertEqual(player.elapsed, 0)
     }
 
+    private var appActive = true
+    private var screenAwake = false
+    private var lastTorch: TorchController?
+
     private func makeLightPlayer(buildEnabled: Bool, torch: FakeTorch) -> SessionPlayer {
         SessionPlayer(
             history: history,
@@ -253,17 +257,30 @@ final class SessionPlayerTests: XCTestCase {
             notificationCenter: NotificationCenter(),
             usesTimer: false,
             integratesWithSystemMedia: false,
-            lightCatalog: [lightFixture],
             lightBuildEnabled: buildEnabled,
+            lightLeadIn: 2,
+            isAppActive: { [unowned self] in self.appActive },
+            keepScreenAwake: { [unowned self] in self.screenAwake = $0 },
             makeTorch: { [unowned self] in
-                TorchController(device: torch, clock: { self.now }, thermalState: { self.thermal }, notificationCenter: NotificationCenter(), schedulesTimers: false)
+                let controller = TorchController(device: torch, clock: { self.now }, thermalState: { self.thermal }, notificationCenter: NotificationCenter(), schedulesTimers: false)
+                self.lastTorch = controller
+                return controller
             }
         )
     }
 
+    /// Steps the latest torch through a few flash cycles of simulated time.
+    private func driveTorch(seconds: TimeInterval = 0.5) {
+        for _ in 0..<Int(seconds / 0.01) {
+            now += 0.01
+            lastTorch?.step()
+        }
+    }
+
     private var lightSession: SessionConfiguration {
         var configuration = tenMinutes
-        configuration.useExperimentalLight = true
+        configuration.useLight = true
+        configuration.lightBrightness = 0.8
         return configuration
     }
 
@@ -283,28 +300,108 @@ final class SessionPlayerTests: XCTestCase {
         player.start(tenMinutes)
         XCTAssertFalse(player.isLightActive)
         XCTAssertTrue(torch.levels.isEmpty)
+        XCTAssertFalse(screenAwake, "Audio sessions may let the screen lock")
     }
 
-    func testPauseStopsLightAndResumeNeverRelights() {
+    func testLightRunsTheRecommendedProgramAtTheChosenBrightness() {
         let torch = FakeTorch()
         let player = makeLightPlayer(buildEnabled: true, torch: torch)
         player.start(lightSession)
         XCTAssertTrue(player.isLightActive)
-        XCTAssertNil(player.notice)
+        XCTAssertEqual(player.lightPlan?.program.id, LightProgramCatalog.relax.id, "Settle In is a calm session")
+        XCTAssertEqual(torch.current, 0, "Dark during the lead-in")
+        XCTAssertTrue(screenAwake, "Light sessions keep the screen awake")
 
+        now += 2 + 60
+        driveTorch()
+        XCTAssertTrue(torch.levels.contains { $0 > 0 })
+        XCTAssertTrue(torch.levels.allSatisfy { $0 <= 0.8 + 1e-6 })
+        let hz = player.lightFrequency ?? 0
+        XCTAssertTrue((6...10).contains(hz), "\(hz) Hz")
+
+        player.end()
+        XCTAssertFalse(player.isLightActive)
+        XCTAssertEqual(torch.current, 0)
+        XCTAssertFalse(screenAwake)
+    }
+
+    func testBrightnessChangesApplyDuringTheSession() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        player.start(lightSession)
+        player.setLightBrightness(0.3)
+        now += 2 + 60
+        driveTorch()
+        XCTAssertTrue(torch.levels.contains { $0 > 0 })
+        XCTAssertTrue(torch.levels.allSatisfy { $0 <= 0.3 + 1e-6 })
+    }
+
+    func testPauseStopsLightAndResumeBringsItBackAfterDarkHold() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        player.start(lightSession)
+        now += 30
+        player.tick()
         player.pause()
         XCTAssertFalse(player.isLightActive)
         XCTAssertEqual(torch.current, 0)
-        XCTAssertEqual(player.notice, .lightStopped("It stays off for the rest of this session."))
+        XCTAssertNil(player.notice)
 
+        now += 100
         player.resume()
         XCTAssertEqual(player.phase, .running)
-        XCTAssertFalse(player.isLightActive)
-        XCTAssertEqual(player.startLight(protocolID: nil), .alreadyUsedThisSession, "No one-tap re-exposure")
-        XCTAssertEqual(torch.current, 0)
+        XCTAssertTrue(player.isLightActive)
+        XCTAssertEqual(torch.current, 0, "Dark first after resuming")
+        let litBefore = torch.levels.filter { $0 > 0 }.count
+        now += SessionPlayer.lightResumeHold
+        driveTorch()
+        XCTAssertGreaterThan(torch.levels.filter { $0 > 0 }.count, litBefore, "Picks up the program where the session is")
     }
 
-    func testInterruptionAndEndStopLight() {
+    func testLightWaitsUntilAfterglowIsOnScreen() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        player.start(lightSession)
+        player.pause()
+        appActive = false
+        player.resume()
+        XCTAssertFalse(player.isLightActive, "Never relight from the lock screen")
+        appActive = true
+        player.handleBecameActive()
+        XCTAssertTrue(player.isLightActive)
+    }
+
+    func testUserCanSwitchLightOffAndBackOn() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        player.start(lightSession)
+        player.setLightEnabled(false)
+        XCTAssertFalse(player.isLightActive)
+        XCTAssertTrue(player.lightSuspendedByUser)
+        player.pause()
+        player.resume()
+        XCTAssertFalse(player.isLightActive, "Stays off until switched back on")
+        player.setLightEnabled(true)
+        XCTAssertTrue(player.isLightActive)
+        XCTAssertFalse(player.lightSuspendedByUser)
+    }
+
+    func testWarmthStopsLightForTheRestOfTheSession() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        player.start(lightSession)
+        thermal = .serious
+        player.handleThermalChange()
+        XCTAssertFalse(player.isLightActive)
+        XCTAssertEqual(player.notice, .lightStopped("Your device is warm."))
+        thermal = .nominal
+        player.pause()
+        player.resume()
+        XCTAssertFalse(player.isLightActive)
+        XCTAssertEqual(player.startLight(), .stoppedThisSession)
+    }
+
+    func testInterruptionStopsLightAndEndTurnsItOff() {
         let torch = FakeTorch()
         let player = makeLightPlayer(buildEnabled: true, torch: torch)
         player.start(lightSession)
@@ -313,7 +410,7 @@ final class SessionPlayerTests: XCTestCase {
         XCTAssertEqual(torch.current, 0)
         player.handleInterruption(interruption(.ended, shouldResume: true))
         XCTAssertEqual(player.phase, .running)
-        XCTAssertFalse(player.isLightActive, "Audio may resume, light must not")
+        XCTAssertTrue(player.isLightActive, "Light comes back with the session")
 
         let second = FakeTorch()
         let other = makeLightPlayer(buildEnabled: true, torch: second)
@@ -324,12 +421,33 @@ final class SessionPlayerTests: XCTestCase {
         XCTAssertEqual(second.current, 0)
     }
 
-    func testLightNeedsTheSessionsOptIn() {
+    func testLightNeedsTheOptIn() {
         let torch = FakeTorch()
         let player = makeLightPlayer(buildEnabled: true, torch: torch)
         player.start(tenMinutes)
-        XCTAssertEqual(player.startLight(protocolID: nil), .consentMissing)
+        XCTAssertEqual(player.startLight(), .consentMissing)
         XCTAssertTrue(torch.levels.isEmpty)
+    }
+
+    func testInvalidCustomProgramIsRefused() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        var configuration = lightSession
+        configuration.lightProgram = .custom(startHz: 30, endHz: 40)
+        player.start(configuration)
+        XCTAssertFalse(player.isLightActive)
+        XCTAssertEqual(player.notice, .lightUnavailable(LightUnavailableReason.invalidProgram.message))
+        XCTAssertTrue(torch.levels.isEmpty)
+    }
+
+    func testSleepLightSwitchesItselfOff() {
+        let torch = FakeTorch()
+        let player = makeLightPlayer(buildEnabled: true, torch: torch)
+        var configuration = SessionConfiguration(preset: PresetCatalog.preset(id: "wind-down")!, minutes: 45)
+        configuration.useLight = true
+        player.start(configuration)
+        XCTAssertEqual(player.lightPlan?.program.id, LightProgramCatalog.sleep.id)
+        XCTAssertEqual(player.lightPlan?.lightDuration, LightProgramCatalog.sleepLightLimit)
     }
 
     func testUnconfirmedTorchOffRaisesPersistentWarningNotALightOffNotice() {
@@ -358,6 +476,7 @@ final class SessionPlayerTests: XCTestCase {
         torch.failOff = false
         player.dismissNotice()
         player.resume()
+        XCTAssertFalse(player.isLightActive, "No relight while the warning is unresolved")
         player.handleInterruption(interruption(.began))
         player.end()
         player.reset()

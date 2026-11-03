@@ -196,11 +196,15 @@ struct SessionConfiguration: Codable, Hashable {
     var volume: Float
     /// Lets the user's own music keep playing underneath (Afterglow's bed is usually muted then).
     var mixWithOtherAudio = false
-    /// Set by the UI only after this session's risk screening and explicit consent. The player
-    /// still refuses unless `LightFeature.isAvailable` (research/Debug build with an allowed protocol).
-    var useExperimentalLight = false
-    /// Which allowed sequence to use; nil picks the first entry of `LightProtocolCatalog.available`.
-    var lightProtocolID: String?
+    /// Set by the UI only after a current safety check and the user's opt-in. The player still
+    /// refuses unless `LightFeature.isAvailable` (Debug build).
+    var useLight = false
+    /// Program to run; nil uses the recommended program for the preset's intent.
+    var lightProgram: LightProgram?
+    /// Requested torch level at full program intensity.
+    var lightBrightness: Float = 0.6
+
+    var intent: SessionIntent? { PresetCatalog.preset(id: presetID)?.intent }
 
     init(presetID: String, title: String, soundscape: Soundscape, duration: TimeInterval, volume: Float = 0.7) {
         self.presetID = presetID

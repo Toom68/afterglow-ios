@@ -58,6 +58,10 @@ final class SessionPlayer: ObservableObject {
     var progress: Double { duration > 0 ? min(1, elapsed / duration) : 0 }
     /// True only while the torch is actually being driven for this session.
     @Published private(set) var isLightActive = false
+    /// The rendered light plan for the current session, once light has started.
+    @Published private(set) var lightPlan: LightPlan?
+    /// The user switched light off mid-session; it stays off until they switch it back on.
+    @Published private(set) var lightSuspendedByUser = false
     /// Set whenever the hardware rejected a torch-off request, so the light may still be on.
     /// Persistent: start, reset, notices and their dismissal never clear it; only
     /// `acknowledgeLightShutdownWarning()` (the user confirming the torch is off) does. While set,
@@ -77,10 +81,23 @@ final class SessionPlayer: ObservableObject {
     private var ticker: Timer?
     private var observers: [NSObjectProtocol] = []
     private var torch: TorchController?
-    private var lightUsedThisSession = false
+    /// Set when light stopped for warmth, a time limit or a hardware fault: it stays off.
+    private var lightBlockedThisSession = false
+    private var screenKeptAwake = false
     private let makeTorch: @MainActor () -> TorchController
-    private let lightCatalog: [LightProtocol]
     private let lightBuildEnabled: Bool
+    private let lightLeadIn: TimeInterval
+    private let isAppActive: @MainActor () -> Bool
+    private let keepScreenAwake: @MainActor (Bool) -> Void
+
+    /// Dark pause before light comes back after a resume or returning to the app.
+    static let lightResumeHold: TimeInterval = 4
+
+    /// Nominal flash frequency right now, while light is on.
+    var lightFrequency: Double? {
+        guard isLightActive, let plan = lightPlan, let t = torch?.planElapsed else { return nil }
+        return plan.frequency(at: t)
+    }
 
     init(
         history: HistoryStore,
@@ -91,8 +108,10 @@ final class SessionPlayer: ObservableObject {
         notificationCenter: NotificationCenter = .default,
         usesTimer: Bool = true,
         integratesWithSystemMedia: Bool = true,
-        lightCatalog: [LightProtocol] = LightProtocolCatalog.available,
         lightBuildEnabled: Bool = LightFeature.buildAllowsLight,
+        lightLeadIn: TimeInterval = 15,
+        isAppActive: (@MainActor () -> Bool)? = nil,
+        keepScreenAwake: (@MainActor (Bool) -> Void)? = nil,
         makeTorch: (@MainActor () -> TorchController)? = nil
     ) {
         self.history = history
@@ -102,8 +121,10 @@ final class SessionPlayer: ObservableObject {
         self.thermalState = thermalState
         center = notificationCenter
         self.usesTimer = usesTimer
-        self.lightCatalog = lightCatalog
         self.lightBuildEnabled = lightBuildEnabled
+        self.lightLeadIn = lightLeadIn
+        self.isAppActive = isAppActive ?? Self.systemAppIsActive
+        self.keepScreenAwake = keepScreenAwake ?? Self.systemKeepScreenAwake
         self.makeTorch = makeTorch ?? { TorchController(clock: clock, thermalState: thermalState, notificationCenter: notificationCenter) }
         nowPlaying = integratesWithSystemMedia ? NowPlayingController() : nil
         nowPlaying?.onPlay = { [weak self] in self?.resume() }
@@ -113,6 +134,21 @@ final class SessionPlayer: ObservableObject {
             Task { @MainActor in self.systemPause(.interruption, notice: .audioUnavailable(detail)) }
         }
         observeSystemEvents()
+    }
+
+    private static func systemAppIsActive() -> Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState == .active
+        #else
+        return true
+        #endif
+    }
+
+    /// Light sessions are eyes-closed and hands-off, so the screen must not auto-lock.
+    private static func systemKeepScreenAwake(_ awake: Bool) {
+        #if canImport(UIKit)
+        UIApplication.shared.isIdleTimerDisabled = awake
+        #endif
     }
 
     deinit {
@@ -142,7 +178,9 @@ final class SessionPlayer: ObservableObject {
             return
         }
         discardTorch()
-        lightUsedThisSession = false
+        lightBlockedThisSession = false
+        lightSuspendedByUser = false
+        lightPlan = nil
         var timeline = SessionTimeline(duration: configuration.duration)
         timeline.start(at: clock())
         self.timeline = timeline
@@ -150,10 +188,8 @@ final class SessionPlayer: ObservableObject {
         startedAt = wallClock()
         sync()
         startTicker()
-        if configuration.useExperimentalLight {
-            if let reason = startLight(protocolID: configuration.lightProtocolID) {
-                notice = .lightUnavailable(reason.message)
-            }
+        if configuration.useLight, let reason = startLight() {
+            notice = .lightUnavailable(reason.message)
         }
     }
 
@@ -178,6 +214,7 @@ final class SessionPlayer: ObservableObject {
         notice = nil
         sync()
         startTicker()
+        resumeLightIfWanted()
     }
 
     /// Ends the session before its planned duration. Saved to history if long enough.
@@ -193,6 +230,7 @@ final class SessionPlayer: ObservableObject {
         startedAt = nil
         lastRecord = nil
         notice = nil
+        lightPlan = nil
         sync()
     }
 
@@ -217,33 +255,36 @@ final class SessionPlayer: ObservableObject {
         }
     }
 
-    // MARK: - Light (research builds only)
+    // MARK: - Light (Debug builds only)
 
-    /// Starts the torch for the running session. `start(_:)` calls this when the configuration
-    /// has `useExperimentalLight`, which the UI sets only after this session's screening and
-    /// consent. Returns why light cannot run, or nil once the torch is on. Light never restarts
-    /// by itself: after any stop it stays off until a new session is deliberately started.
+    /// Starts (or restarts) the torch for the running session at the session's current point,
+    /// after `holdOff` seconds of darkness. `start(_:)` calls this when the configuration has
+    /// `useLight`, which the UI sets only after a current safety check. Returns why light cannot
+    /// run, or nil when the torch is running or the light part of the session is already over.
     @discardableResult
-    func startLight(protocolID: String?) -> LightUnavailableReason? {
-        guard phase == .running else { return .sessionNotRunning }
-        // Only a configuration the UI built after this session's screening and consent may light.
-        guard configuration?.useExperimentalLight == true else { return .consentMissing }
-        guard !lightUsedThisSession else { return .alreadyUsedThisSession }
+    func startLight(holdOff: TimeInterval = 0) -> LightUnavailableReason? {
+        guard phase == .running, let configuration, let timeline else { return .sessionNotRunning }
+        guard configuration.useLight else { return .consentMissing }
+        guard !lightBlockedThisSession else { return .stoppedThisSession }
         guard lightShutdownWarning == nil else { return .shutdownUnconfirmed }
-        let decision = LightGate.evaluate(
-            buildAllowsLight: lightBuildEnabled,
-            protocolID: protocolID,
-            catalog: lightCatalog,
-            screeningPassed: true,
-            consentedThisSession: true,
-            thermal: thermalState()
-        )
-        guard case .success(let light) = decision else {
-            if case .failure(let reason) = decision { return reason }
-            return .noProtocolAvailable
+        let requested = configuration.lightProgram ?? LightProgramCatalog.recommended(for: configuration.intent ?? .calm)
+        let program: LightProgram
+        switch LightGate.evaluate(buildAllowsLight: lightBuildEnabled, program: requested, consented: true, thermal: thermalState()) {
+        case .success(let allowed): program = allowed
+        case .failure(let reason): return reason
         }
-        lightUsedThisSession = true
+        let sleepy = configuration.intent == .sleep || program.id == LightProgramCatalog.sleep.id
+        let plan = LightPlan.forSession(
+            program: program,
+            sessionDuration: configuration.duration,
+            brightness: min(max(configuration.lightBrightness, 0.05), TorchController.bounds.brightnessCeiling),
+            leadIn: lightLeadIn,
+            maximumLight: sleepy ? LightProgramCatalog.sleepLightLimit : nil
+        )
+        let offset = timeline.elapsed(at: clock())
         discardTorch()
+        lightPlan = plan
+        guard offset < plan.totalDuration else { return nil }
         // A fresh controller per run means a callback from an earlier run can never touch this one.
         let torch = makeTorch()
         torch.onStop = { [weak self, weak torch] reason in
@@ -252,7 +293,7 @@ final class SessionPlayer: ObservableObject {
         }
         self.torch = torch
         do {
-            try torch.start(light, allowedCatalog: lightCatalog)
+            try torch.start(plan, at: offset, holdOff: holdOff)
         } catch {
             // Capture a failed off request from inside start before the cleanup retry can mask it.
             reportUnconfirmedOff()
@@ -263,12 +304,51 @@ final class SessionPlayer: ObservableObject {
         return nil
     }
 
+    /// Mid-session light switch. Off stays off until switched back on; on resumes the program
+    /// where the session is now, after a short dark pause.
+    func setLightEnabled(_ enabled: Bool) {
+        guard configuration?.useLight == true else { return }
+        lightSuspendedByUser = !enabled
+        if enabled {
+            if phase == .running, let reason = startLight(holdOff: Self.lightResumeHold) {
+                notice = .lightUnavailable(reason.message)
+            }
+        } else {
+            stopLight(.requested)
+        }
+    }
+
+    /// Changes the torch brightness of the running session immediately.
+    func setLightBrightness(_ brightness: Float) {
+        let level = min(max(brightness, 0.05), TorchController.bounds.brightnessCeiling)
+        configuration?.lightBrightness = level
+        torch?.setPeakLevel(level)
+    }
+
     func stopLight() {
         stopLight(.requested)
     }
 
+    private func resumeLightIfWanted() {
+        guard phase == .running, configuration?.useLight == true, !isLightActive, !lightSuspendedByUser,
+              !lightBlockedThisSession, lightShutdownWarning == nil, isAppActive() else { return }
+        if let reason = startLight(holdOff: Self.lightResumeHold) {
+            notice = .lightUnavailable(reason.message)
+        }
+    }
+
+    func handleBecameActive() {
+        tick()
+        resumeLightIfWanted()
+    }
+
     /// The user confirmed the flashlight is physically off. The only normal way to clear the warning.
     func acknowledgeLightShutdownWarning() {
+        // Drop the controller that failed, so its stale error cannot raise the warning again.
+        torch?.onStop = nil
+        torch?.hardStop(.requested)
+        torch = nil
+        isLightActive = false
         lightShutdownWarning = nil
     }
 
@@ -285,14 +365,9 @@ final class SessionPlayer: ObservableObject {
         guard var timeline, timeline.pause(reason, at: clock()) else { return }
         self.timeline = timeline
         audio.pause(fadeOut: fadeOut)
-        let hadLight = isLightActive
         stopLight(.requested)
         stopTicker()
-        if let newNotice {
-            notice = newNotice
-        } else if hadLight, torch?.offCommandError == nil {
-            notice = .lightStopped("It stays off for the rest of this session.")
-        }
+        if let newNotice { notice = newNotice }
         sync()
     }
 
@@ -367,14 +442,18 @@ final class SessionPlayer: ObservableObject {
         case .requested:
             break
         case .finished:
-            notice = .lightStopped("The light sequence finished. Audio continues.")
-        case .timeout:
-            notice = .lightStopped("It reached its time limit.")
+            notice = .lightStopped("The light program finished. Audio continues.")
         case .appInactive:
-            notice = .lightStopped("Afterglow left the screen.")
+            // Comes back by itself, after a dark pause, when Afterglow is on screen again.
+            break
+        case .timeout:
+            lightBlockedThisSession = true
+            notice = .lightStopped("It reached its time limit.")
         case .thermal:
+            lightBlockedThisSession = true
             notice = .lightStopped("Your device is warm.")
         case .failure(let error):
+            lightBlockedThisSession = true
             notice = .lightStopped(error.localizedDescription)
         }
     }
@@ -391,6 +470,11 @@ final class SessionPlayer: ObservableObject {
         if phaseChanged {
             let owned = phase.isActive && configuration?.mixWithOtherAudio != true
             nowPlaying?.update(configuration: owned ? configuration : nil, elapsed: elapsed, isPlaying: phase.isRunning)
+        }
+        let awake = phase.isActive && configuration?.useLight == true
+        if awake != screenKeptAwake {
+            screenKeptAwake = awake
+            keepScreenAwake(awake)
         }
     }
 
@@ -418,6 +502,7 @@ final class SessionPlayer: ObservableObject {
         add(ProcessInfo.thermalStateDidChangeNotification) { player, _ in player.handleThermalChange() }
         #if canImport(UIKit)
         add(UIApplication.willEnterForegroundNotification) { player, _ in player.tick() }
+        add(UIApplication.didBecomeActiveNotification) { player, _ in player.handleBecameActive() }
         add(UIApplication.willTerminateNotification) { player, _ in player.finish(.interrupted) }
         #endif
     }
