@@ -1,0 +1,31 @@
+{
+  "checked_at_utc": "2026-10-31T13:52:18.409608+00:00",
+  "platform": "Windows; Bash syntax checks through Ubuntu WSL",
+  "tools": {
+    "tree_sitter": "0.26.0",
+    "tree_sitter_swift": "0.7.4"
+  },
+  "swift_files_syntax_parsed": 25,
+  "swift_syntax_error_files": [],
+  "xctest_methods_authored_not_run": 79,
+  "xcode_project_objects_parsed": 27,
+  "project_reference_integrity": "passed",
+  "plist_and_privacy_files_parsed": 2,
+  "scheme_workspace_xml_files_parsed": 2,
+  "asset_json_files_parsed": 4,
+  "app_icon": "1024x1024 RGB, no alpha; visually inspected",
+  "release_light_gate": "research flag absent from all Release configs; archive scheme uses Release",
+  "debug_light_gate": "research flag present only in Debug",
+  "bash_syntax_check": "passed for ci-test.sh and package-source.sh",
+  "powershell_syntax_check": "passed for package-source.ps1",
+  "ci_yaml_structure": "parsed; expected build-and-test and source-package jobs present",
+  "archive_dry_run": "passed CRC, forward-slash paths, no absolute/traversal paths, expected contents and LF shell scripts",
+  "not_run": [
+    "Xcode compile",
+    "XCTest execution",
+    "iOS simulator runtime",
+    "physical iPhone tests",
+    "optical output measurement",
+    "signed IPA/TestFlight/App Store distribution"
+  ]
+}

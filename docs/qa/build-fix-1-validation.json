@@ -1,0 +1,24 @@
+{
+  "checked_at_utc": "2026-11-01T07:08:42.823248+00:00",
+  "platform": "Windows, no Swift compiler or Xcode SDK available",
+  "reported_mac_build": "User screenshot: Components wrappedValue error; three LightTests actor-isolation warnings",
+  "modified_swift_files": [
+    "ios/Afterglow/Views/Components.swift",
+    "ios/Afterglow/Core/Light/TorchController.swift"
+  ],
+  "checks": {
+    "font_change_is_only_wrapper_declaration": "passed",
+    "explicit_wrapped_value_and_body_reference_retained": "passed",
+    "controller_change_is_only_nonisolated_numeric_constants": "passed",
+    "constant_values_and_mutable_actor_isolation_preserved": "passed",
+    "project_and_signing_configuration_unchanged": "passed",
+    "swift_files_syntax_parsed": 25,
+    "syntax_error_files": []
+  },
+  "previous_package_sha256": "d3527ec2e4abc611fe2327e2a8011a7907049f78f498cb38121cadf4c225c9cb",
+  "not_run": [
+    "Xcode compile after repair",
+    "XCTest execution",
+    "iPhone runtime"
+  ]
+}

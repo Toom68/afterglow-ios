@@ -1,0 +1,63 @@
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and unit test
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Uses the runner image's default Xcode (16.x or newer on macos-15). To pin one, set the
+      # repository variable XCODE_APP, e.g. "Xcode_16.4".
+      - name: Select Xcode
+        env:
+          XCODE_APP: ${{ vars.XCODE_APP }}
+        run: |
+          if [ -n "$XCODE_APP" ]; then sudo xcode-select -s "/Applications/$XCODE_APP.app/Contents/Developer"; fi
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Build and test
+        run: bash scripts/ci-test.sh
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: TestResults
+          path: build/TestResults-*.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+  source-package:
+    name: Source ZIP
+    runs-on: macos-15
+    needs: build-and-test
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Package source
+        run: bash scripts/package-source.sh
+
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: Afterglow-source
+          path: dist/*.zip
+          retention-days: 14
