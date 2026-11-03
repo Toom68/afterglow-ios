@@ -79,9 +79,9 @@ final class SystemTorchDevice: TorchDevice {
 /// immediate stop request on every exit path. A stop is a software request: if the off command
 /// fails it is reported via `offCommandError`.
 ///
-/// Timing: each level change is scheduled for its exact edge, computed from the absolute start
-/// time (no cumulative drift), on a strict zero-leeway main-queue timer. Main-thread load,
-/// `lockForConfiguration` latency and the LED driver add some jitter.
+/// Timing: flashes are played by `TorchDriver` on a dedicated high-priority thread against
+/// absolute edge times (no cumulative drift), so UI work cannot delay or drop them.
+/// `lockForConfiguration` latency and the LED driver still add some jitter.
 @MainActor
 final class TorchController {
     nonisolated static let bounds = LightBounds.standard
@@ -108,7 +108,7 @@ final class TorchController {
     /// Plan time before which the torch is held off (a dark pause after resuming).
     private var holdUntil: TimeInterval = 0
     private var peakOverride: Float?
-    private var timer: DispatchSourceTimer?
+    private var driver: TorchDriver?
     private var watchdog: DispatchSourceTimer?
     /// Incremented on every start/stop so a timer event from an earlier run is ignored.
     private var generation = 0
@@ -129,7 +129,7 @@ final class TorchController {
     }
 
     deinit {
-        timer?.cancel()
+        driver?.cancel()
         watchdog?.cancel()
         try? device.setLevel(0)
         for observer in observers { center.removeObserver(observer) }
@@ -161,23 +161,31 @@ final class TorchController {
         lastStopReason = nil
         observeInterruptions()
         armWatchdog()
-        step()
-        if !isRunning, case .failure(let error)? = lastStopReason { throw error }
+        if schedulesTimers {
+            startDriver(plan: plan)
+        } else {
+            step()
+            if !isRunning, case .failure(let error)? = lastStopReason { throw error }
+        }
     }
 
     /// Changes the brightness of the running plan from its next flash onward.
     func setPeakLevel(_ level: Float) {
         guard isRunning, level.isFinite, level > 0 else { return }
         peakOverride = min(level, Self.bounds.brightnessCeiling)
+        driver?.setPeak(min(level, Self.bounds.brightnessCeiling))
     }
+
+    /// Flash timing measured by the playback thread for the current run.
+    var timingStats: TorchDriver.Stats? { driver?.stats }
 
     /// Cancels all pending callbacks, then requests torch off. Idempotent.
     func hardStop(_ reason: TorchStopReason = .requested) {
         hardStop(reason, notify: true)
     }
 
-    /// Applies the level for the current instant and schedules the next boundary. Exposed so
-    /// tests (and a stalled timer) can drive it; calling it early or late is harmless.
+    /// Applies the level for the current instant. Used instead of the playback thread when
+    /// `schedulesTimers` is false, so unit tests can drive time deterministically.
     func step() {
         guard isRunning, let plan = planInUse else { return }
         let elapsed = clock() - startedAt
@@ -202,26 +210,33 @@ final class TorchController {
                 return hardStop(.failure(.configurationFailed(error.localizedDescription)))
             }
         }
-        guard let next = plan.nextBoundary(after: elapsed) else { return hardStop(.finished) }
-        schedule(at: elapsed < holdUntil ? min(holdUntil, next) : next)
+        if plan.nextBoundary(after: elapsed) == nil { return hardStop(.finished) }
     }
 
-    private func schedule(at boundary: TimeInterval) {
-        timer?.cancel()
-        timer = nil
-        guard schedulesTimers else { return }
-        let delay = max(0, boundary - (clock() - startedAt))
+    /// Hands playback to a dedicated thread; its stop reasons come back on the main actor.
+    private func startDriver(plan: LightPlan) {
         let token = generation
-        let source = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
-        source.schedule(deadline: .now() + delay, leeway: .nanoseconds(0))
-        source.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.generation == token else { return }
-                self.step()
+        let driver = TorchDriver(
+            plan: plan,
+            device: device,
+            clock: clock,
+            thermalState: thermalState,
+            startedAt: startedAt,
+            holdUntil: holdUntil,
+            peak: plan.peakTorchLevel,
+            ceiling: Self.bounds.brightnessCeiling,
+            hardTimeout: Self.hardTimeout,
+            onStop: { [weak self] reason in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self, self.generation == token, self.isRunning else { return }
+                        self.hardStop(reason)
+                    }
+                }
             }
-        }
-        timer = source
-        source.resume()
+        )
+        self.driver = driver
+        driver.start()
     }
 
     private func armWatchdog() {
@@ -246,8 +261,10 @@ final class TorchController {
     private func hardStop(_ reason: TorchStopReason, notify: Bool) {
         let wasRunning = isRunning
         generation += 1
-        timer?.cancel()
-        timer = nil
+        // Synchronous: once this returns, the playback thread can issue no further command,
+        // so the off request below is guaranteed to be the last one.
+        driver?.cancel()
+        driver = nil
         watchdog?.cancel()
         watchdog = nil
         isRunning = false

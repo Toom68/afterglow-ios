@@ -93,6 +93,9 @@ final class SessionPlayer: ObservableObject {
     /// Dark pause before light comes back after a resume or returning to the app.
     static let lightResumeHold: TimeInterval = 4
 
+    /// Measured flash timing for the current light run.
+    var lightTiming: TorchDriver.Stats? { torch?.timingStats }
+
     /// Nominal flash frequency right now, while light is on.
     var lightFrequency: Double? {
         guard isLightActive, let plan = lightPlan, let t = torch?.planElapsed else { return nil }

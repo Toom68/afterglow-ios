@@ -6,7 +6,8 @@ struct SessionFlowView: View {
     @State private var sequenceIndex = 0
     private var preset: SessionPreset { sequence[sequenceIndex] }
     private var isJourney: Bool { sequence.count > 1 }
-    private var hasTorchHardware: Bool { SystemTorchDevice().hasTorch }
+    private static let torchHardwarePresent = SystemTorchDevice().hasTorch
+    private var hasTorchHardware: Bool { Self.torchHardwarePresent }
     @EnvironmentObject private var player: SessionPlayer
     @EnvironmentObject private var history: HistoryStore
     @EnvironmentObject private var settings: SettingsStore
@@ -481,6 +482,11 @@ struct SessionFlowView: View {
                     Image(systemName: "sun.max").accessibilityHidden(true)
                 }
                 .agFont(12).foregroundStyle(AfterglowTheme.muted)
+                if let timing = player.lightTiming, timing.flashes > 0 {
+                    Text("\(timing.flashes) flashes · \(timing.dropped) dropped · avg \(String(format: "%.1f", timing.averageLateness * 1000)) ms late · max \(String(format: "%.0f", timing.maximumLateness * 1000)) ms")
+                        .agFont(9, design: .monospaced).foregroundStyle(AfterglowTheme.muted)
+                        .accessibilityLabel("Flash timing")
+                }
             }
         }
     }
