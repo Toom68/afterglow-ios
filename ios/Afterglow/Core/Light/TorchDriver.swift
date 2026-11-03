@@ -163,32 +163,32 @@ final class TorchDriver: @unchecked Sendable {
             // A full planned interval behind is an overrun, including after blocked commands.
             let end = index + 1 < plan.edges.count ? plan.edges[index + 1].time : plan.totalDuration
             if elapsed >= end { reason = .cannotKeepUp; return }
+            var adapterCap: Float = 0
             if edge.level > 0 {
                 guard device.isTorchAvailable else { reason = .failure(.torchUnavailable); return }
-                guard device.maxAvailableLevel > 0 else { reason = .thermal; return }
+                adapterCap = device.maxAvailableLevel
+                guard adapterCap.isFinite, adapterCap > 0 else { reason = .thermal; return }
             }
             state.lock(); let selectedPeak = peak; state.unlock()
-            let level = edge.level > 0 ? edge.level * min(ceiling, selectedPeak, device.maxAvailableLevel) : 0
+            let level = edge.level > 0 ? edge.level * min(ceiling, selectedPeak, adapterCap) : 0
             // Device capability queries can also stall. Recheck immediately before admission.
             guard !isCancelled else { return }
             if elapsed >= hardTimeout { reason = .timeout; return }
             if elapsed >= plan.totalDuration { return }
             if elapsed >= end { reason = .cannotKeepUp; return }
+            if thermalState().rawValue >= ProcessInfo.ThermalState.serious.rawValue { reason = .thermal; return }
             let commandStart = clock()
+            var failure: TorchError?
             do { try device.setLevel(level) }
-            catch {
-                let failure = error as? TorchError ?? .configurationFailed(error.localizedDescription)
-                if level == 0 { state.lock(); offError = failure; state.unlock() }
-                reason = .failure(failure)
-                return
-            }
+            catch { failure = error as? TorchError ?? .configurationFailed(error.localizedDescription) }
             let returnedAt = elapsed
             let commandTime = max(0, clock() - commandStart)
             state.lock()
             statsValue.commands += 1
             statsValue.totalCommandTime += commandTime
             statsValue.maximumCommandTime = max(statsValue.maximumCommandTime, commandTime)
-            if level > 0 {
+            if level == 0, let failure { offError = failure }
+            if failure == nil, level > 0 {
                 let lateness = max(0, returnedAt - edge.time)
                 statsValue.flashes += 1
                 statsValue.totalLateness += lateness
@@ -196,11 +196,12 @@ final class TorchDriver: @unchecked Sendable {
                 statsValue.recordFlash(at: returnedAt)
             }
             state.unlock()
+            if let failure { reason = .failure(failure); return }
             previousReturn = returnedAt
             previousPlanned = edge.time
             index += 1
             if returnedAt >= hardTimeout { reason = .timeout; return }
-            if returnedAt >= plan.totalDuration { return }
+            if returnedAt >= plan.totalDuration { reason = .cannotKeepUp; return }
             if returnedAt >= end { reason = .cannotKeepUp; return }
         }
         if !wait(until: plan.totalDuration) { return }

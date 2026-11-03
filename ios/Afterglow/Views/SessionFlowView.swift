@@ -505,7 +505,7 @@ struct SessionFlowView: View {
                 }
                 .agFont(12).foregroundStyle(AfterglowTheme.muted)
                 if let timing = player.lightTiming, timing.flashes > 0 {
-                    Text("target \(player.lightFrequency.map { String(format: "%.1f", $0) } ?? "–") / API returns \(timing.achievedRate.map { String(format: "%.1f", $0) } ?? "–") Hz · \(timing.flashes) flashes · \(timing.dropped) dropped · late \(String(format: "%.1f", timing.averageLateness * 1000)) ms · torch \(String(format: "%.1f", timing.averageCommandTime * 1000))/\(String(format: "%.0f", timing.maximumCommandTime * 1000)) ms")
+                    Text("API-command timing ? target \(player.lightFrequency.map { String(format: "%.1f", $0) } ?? "–") / API returns \(timing.achievedRate.map { String(format: "%.1f", $0) } ?? "–") Hz · \(timing.flashes) flashes · \(timing.dropped) dropped · late \(String(format: "%.1f", timing.averageLateness * 1000)) ms · torch \(String(format: "%.1f", timing.averageCommandTime * 1000))/\(String(format: "%.0f", timing.maximumCommandTime * 1000)) ms")
                         .agFont(9, design: .monospaced).foregroundStyle(AfterglowTheme.muted)
                         .accessibilityLabel("API-command timing, not measured optical rate")
                 }

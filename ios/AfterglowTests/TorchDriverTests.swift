@@ -301,6 +301,21 @@ final class TorchDriverAdversarialTests: XCTestCase {
         }
     }
 
+    func testPositiveCallReturningAfterPlanEndStopsWithoutAnotherPositiveRequest() {
+        let torch = AdversarialTorch()
+        torch.positiveDelay = 0.8
+        let stopped = expectation(description: "command exceeded duration")
+        let playback = driver(plan(10, duration: 0.2), torch) { reason in
+            XCTAssertEqual(reason, .cannotKeepUp)
+            stopped.fulfill()
+        }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0])
+        XCTAssertEqual(playback.stats.dropped, 1)
+        XCTAssertEqual(torch.commands.last?.issued ?? -1, 0.8, accuracy: 1e-9)
+    }
+
     func testOffEdgeRejectionSurvivesSuccessfulTerminationRetry() {
         let torch = AdversarialTorch()
         torch.rejectOffCount = 1
