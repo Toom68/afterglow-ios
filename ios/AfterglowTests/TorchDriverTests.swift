@@ -65,7 +65,7 @@ final class TorchDriverTests: XCTestCase {
         LightPlan(program: .custom(startHz: hz, endHz: hz), preparationDelay: 0, lightDuration: seconds, peakTorchLevel: peak, fadeIn: 0, fadeOut: 0)
     }
 
-    func testEveryFlashArrivesEvenWhileTheMainThreadIsBusy() {
+    func testInstantaneousDeviceCommandsWhileMainThreadIsBusy() {
         let torch = RecordingTorch()
         let finished = expectation(description: "finished")
         let driver = makeDriver(steady(10, seconds: 1.5), torch: torch) { reason in
@@ -84,6 +84,7 @@ final class TorchDriverTests: XCTestCase {
         // Strict alternation: on, off, on, off...
         let changes = torch.levels
         for (index, level) in changes.enumerated() {
+            if index > 0, level == 0, changes[index - 1] == 0 { continue }
             XCTAssertEqual(level > 0, index % 2 == 0, "edge \(index) breaks the on/off rhythm")
         }
     }
@@ -117,7 +118,7 @@ final class TorchDriverTests: XCTestCase {
         XCTAssertFalse(finishedTorch.exclusiveState.held, "Released when the plan ends")
     }
 
-    func testReportsTheRateActuallyDelivered() {
+    func testReportsPositiveAPICommandReturnRate() {
         let torch = RecordingTorch()
         let driver = makeDriver(steady(12, seconds: 10), torch: torch)
         driver.start()
@@ -154,5 +155,221 @@ final class TorchDriverTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.4)
         driver.cancel()
         XCTAssertTrue(torch.levels.contains { $0 > 0 })
+    }
+}
+
+/// Virtual clock and adversarial adapter. Only the playback thread advances virtual time;
+/// snapshots are synchronized so the test thread can inspect blocked calls safely.
+final class AdversarialTorch: TorchDevice, @unchecked Sendable {
+    struct Command { let level: Float; let issued: TimeInterval; let returned: TimeInterval }
+    private let lock = NSLock()
+    private var time: TimeInterval = 0
+    private var recorded: [Command] = []
+    var positiveDelay: TimeInterval = 0
+    var offDelay: TimeInterval = 0
+    var capabilityDelay: TimeInterval = 0
+    var rejectPositive = false
+    var rejectOffCount = 0
+    var beforePositive: (() -> Void)?
+    var hasTorch: Bool { true }
+    var isTorchAvailable: Bool { advance(capabilityDelay); return true }
+    var maxAvailableLevel: Float { 1 }
+    var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return time }
+    var commands: [Command] { lock.lock(); defer { lock.unlock() }; return recorded }
+    func advance(_ delay: TimeInterval) { lock.lock(); time += delay; lock.unlock() }
+    func setLevel(_ level: Float) throws {
+        let issued = now
+        if level > 0 { beforePositive?() }
+        advance(level > 0 ? positiveDelay : offDelay)
+        lock.lock()
+        recorded.append(Command(level: level, issued: issued, returned: time))
+        lock.unlock()
+        if level == 0, rejectOffCount > 0 {
+            rejectOffCount -= 1
+            throw TorchError.configurationFailed("off rejected")
+        }
+        if level > 0, rejectPositive { throw TorchError.configurationFailed("on rejected") }
+    }
+}
+
+final class TorchDriverAdversarialTests: XCTestCase {
+    private func plan(_ hz: Double = 10, duration: TimeInterval = 1, peak: Float = 0.5, fade: TimeInterval = 0) -> LightPlan {
+        LightPlan(program: .custom(startHz: hz, endHz: hz), preparationDelay: 0,
+                  lightDuration: duration, peakTorchLevel: peak, fadeIn: fade, fadeOut: fade)
+    }
+    private func driver(_ plan: LightPlan, _ torch: AdversarialTorch,
+                        timeout: TimeInterval = 100,
+                        thermal: @escaping () -> ProcessInfo.ThermalState = { .nominal },
+                        stop: @escaping (TorchStopReason) -> Void) -> TorchDriver {
+        TorchDriver(plan: plan, device: torch, clock: { torch.now }, thermalState: thermal,
+                    startedAt: 0, holdUntil: 0, peak: plan.peakTorchLevel, ceiling: 1,
+                    hardTimeout: timeout, waitForDelay: { torch.advance($0) }, onStop: stop)
+    }
+
+    func testFinalOnPlanIsOffBeforeCallbackEvenWithMainDeliveryWithheld() {
+        let torch = AdversarialTorch()
+        let workerReturned = DispatchSemaphore(value: 0)
+        let delivered = expectation(description: "main callback")
+        let playback = driver(plan(1, duration: 0.02), torch) { reason in
+            XCTAssertEqual(reason, .finished)
+            XCTAssertEqual(torch.commands.last?.level, 0)
+            workerReturned.signal()
+            DispatchQueue.main.async { delivered.fulfill() }
+        }
+        playback.start()
+        // Main delivery is withheld while this thread waits; worker off must already exist.
+        XCTAssertEqual(workerReturned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0])
+        XCTAssertEqual(torch.commands.last?.issued ?? -1, 0.02, accuracy: 1e-9)
+        wait(for: [delivered], timeout: 2)
+    }
+
+    func testSlowCommandsStopWithoutCatchUpAtTenAndTwentyHz() {
+        for hz in [10.0, 20.0] {
+            for delay in [0.09, 0.6] {
+                let torch = AdversarialTorch()
+                torch.positiveDelay = delay
+                let stopped = expectation(description: "overrun")
+                let playback = driver(plan(hz, duration: 2), torch) { reason in
+                    XCTAssertEqual(reason, .cannotKeepUp)
+                    stopped.fulfill()
+                }
+                playback.start()
+                wait(for: [stopped], timeout: 2)
+                XCTAssertEqual(torch.commands.filter { $0.level > 0 }.count, 1)
+                XCTAssertEqual(torch.commands.last?.level, 0)
+                XCTAssertEqual(playback.stats.dropped, Int(2 * hz) - 1)
+                XCTAssertLessThan(torch.now, 2)
+            }
+        }
+    }
+
+    func testBothIntervalsRemainAtLeastPlannedLengthWithSmallCommandLatency() {
+        for hz in [10.0, 20.0] {
+            let torch = AdversarialTorch()
+            torch.positiveDelay = 0.001
+            torch.offDelay = 0.001
+            let stopped = expectation(description: "finished")
+            let playback = driver(plan(hz, duration: 1), torch) { _ in stopped.fulfill() }
+            playback.start()
+            wait(for: [stopped], timeout: 2)
+            let commands = torch.commands
+            for index in 1..<commands.count {
+                // Final emergency off has priority over interval preservation.
+                if index == commands.count - 1 { continue }
+                XCTAssertGreaterThanOrEqual(commands[index].issued - commands[index - 1].returned,
+                                            0.5 / hz - 1e-9)
+            }
+            XCTAssertEqual(commands.last?.level, 0)
+            XCTAssertLessThanOrEqual(torch.now, 1.001 + 1e-9)
+        }
+    }
+
+    func testExpiredPlanNeverIssuesNewPositiveCommandIncludingStalledCapabilityQuery() {
+        for delay in [0.03, 0.8] {
+            let torch = AdversarialTorch()
+            torch.capabilityDelay = delay
+            let stopped = expectation(description: "expired")
+            let playback = driver(plan(1, duration: 0.02), torch) { reason in
+                XCTAssertEqual(reason, .finished)
+                stopped.fulfill()
+            }
+            playback.start()
+            wait(for: [stopped], timeout: 2)
+            XCTAssertTrue(torch.commands.allSatisfy { $0.level == 0 })
+            XCTAssertEqual(playback.stats.dropped, 1)
+        }
+    }
+
+    func testThermalTimeoutAndOnFailureAllRequestOffBeforeCallback() {
+        for mode in 0..<3 {
+            let torch = AdversarialTorch()
+            torch.rejectPositive = mode == 2
+            let stopped = expectation(description: "exit")
+            let playback = driver(plan(), torch, timeout: mode == 1 ? 0.02 : 100,
+                                  thermal: { mode == 0 && torch.now >= 0.02 ? .serious : .nominal }) { reason in
+                XCTAssertEqual(torch.commands.last?.level, 0)
+                if mode == 0 { XCTAssertEqual(reason, .thermal) }
+                if mode == 1 { XCTAssertEqual(reason, .timeout) }
+                if mode == 2 { XCTAssertEqual(reason, .failure(.configurationFailed("on rejected"))) }
+                stopped.fulfill()
+            }
+            playback.start()
+            wait(for: [stopped], timeout: 2)
+            XCTAssertTrue(torch.commands.contains { $0.level > 0 })
+            XCTAssertEqual(torch.commands.last?.level, 0)
+        }
+    }
+
+    func testOffEdgeRejectionSurvivesSuccessfulTerminationRetry() {
+        let torch = AdversarialTorch()
+        torch.rejectOffCount = 1
+        let stopped = expectation(description: "off rejection")
+        let playback = driver(plan(), torch) { reason in
+            XCTAssertEqual(reason, .failure(.configurationFailed("off rejected")))
+            stopped.fulfill()
+        }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(playback.offCommandError, .configurationFailed("off rejected"))
+        XCTAssertEqual(torch.commands.last?.level, 0)
+        XCTAssertEqual(torch.commands.filter { $0.level == 0 }.count, 2)
+    }
+
+    func testTerminationOffRejectionIsRetainedEvenIfRetrySucceeds() {
+        let torch = AdversarialTorch()
+        torch.rejectOffCount = 1
+        let stopped = expectation(description: "finished with off warning")
+        let playback = driver(plan(1, duration: 0.02), torch) { _ in stopped.fulfill() }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        XCTAssertEqual(playback.offCommandError, .configurationFailed("off rejected"))
+        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0, 0])
+    }
+
+    func testStatsPeakAndCancelRequestDoNotWaitForBlockedHardware() {
+        let torch = AdversarialTorch()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        torch.beforePositive = { entered.signal(); _ = release.wait(timeout: .now() + 3) }
+        let playback = driver(plan(), torch) { _ in }
+        playback.start()
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let start = MonotonicClock.now()
+        XCTAssertEqual(playback.stats.commands, 0)
+        playback.setPeak(0.08)
+        playback.requestCancel()
+        XCTAssertLessThan(MonotonicClock.now() - start, 0.1)
+        release.signal()
+        playback.cancel() // Shutdown barrier: no commands can follow after this returns.
+        XCTAssertEqual(torch.commands.map(\.level), [0.5, 0])
+        XCTAssertNil(playback.offCommandError)
+    }
+
+    func testCancelBeforeStartStillShutsDownOnWorker() {
+        let torch = AdversarialTorch()
+        let playback = driver(plan(), torch) { _ in XCTFail("Cancelled callback") }
+        playback.requestCancel()
+        playback.start()
+        playback.cancel()
+        XCTAssertEqual(torch.commands.map(\.level), [0])
+    }
+
+    func testExplicitAdapterRequestNeverRoundsUpIncludingFadeBoundaries() {
+        for level in [Float(0.0001), 0.0249, 0.025, 0.0499, 0.05, 0.0501, 0.0749, 0.08, 0.0999, 1] {
+            XCTAssertEqual(SystemTorchDevice.requestLevel(level), level)
+            XCTAssertLessThanOrEqual(SystemTorchDevice.requestLevel(level), level)
+        }
+        let torch = AdversarialTorch()
+        let stopped = expectation(description: "fade")
+        let rendered = plan(10, duration: 0.3, peak: 0.05, fade: 1)
+        let playback = driver(rendered, torch) { _ in stopped.fulfill() }
+        playback.start()
+        wait(for: [stopped], timeout: 2)
+        let positive = torch.commands.filter { $0.level > 0 }
+        XCTAssertEqual(positive.first?.level ?? 0, 0.025, accuracy: 1e-6)
+        for (command, edge) in zip(positive, rendered.edges.filter { $0.level > 0 }) {
+            XCTAssertLessThanOrEqual(command.level, edge.level * rendered.peakTorchLevel)
+        }
     }
 }

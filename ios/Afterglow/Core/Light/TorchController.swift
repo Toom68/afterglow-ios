@@ -28,6 +28,7 @@ enum TorchStopReason: Hashable {
     case timeout
     case appInactive
     case thermal
+    case cannotKeepUp
     case failure(TorchError)
 }
 
@@ -97,39 +98,20 @@ final class SystemTorchDevice: TorchDevice, @unchecked Sendable {
             return
         }
         guard device.isTorchAvailable else { throw TorchError.torchUnavailable }
-        // `setTorchModeOn(level:)` is slow and erratic when called for every flash, which made
-        // the hardware fall behind fast flicker. Set the level only when it changes (quantised
-        // so fades don't change it on every flash) and flash with the fast `torchMode` toggle.
-        let quantised = Self.quantise(level)
-        if fastToggleWorks, configuredLevel == quantised {
-            device.torchMode = .on
-            if !verifiedFastToggle {
-                verifiedFastToggle = true
-                // If this device ignores the stored level on a plain toggle, stop using it.
-                if abs(device.torchLevel - quantised) > 0.15 { fastToggleWorks = false; try setExplicitly(quantised, on: device) }
-            }
-            return
-        }
-        try setExplicitly(quantised, on: device)
-    }
-
-    private var configuredLevel: Float?
-    private var fastToggleWorks = true
-    private var verifiedFastToggle = false
-
-    private func setExplicitly(_ level: Float, on device: AVCaptureDevice) throws {
+        // Use Apple's explicit-level API for every positive request. Plain .on toggles
+        // have no verified amplitude-preservation contract on our supported devices.
         do {
-            try device.setTorchModeOn(level: level)
-            configuredLevel = level
+            try device.setTorchModeOn(level: Self.requestLevel(level))
         } catch {
-            configuredLevel = nil
             throw TorchError.configurationFailed(error.localizedDescription)
         }
     }
 
-    /// Steps of 5%, never zero, never above the maximum the API accepts.
-    static func quantise(_ level: Float) -> Float {
-        min(max((level * 20).rounded() / 20, 0.05), 1)
+    /// No minimum or rounding step: sub-5% fades must not exceed the selected request.
+    /// Unsupported positive requests are reported as errors by the platform, never raised.
+    static func requestLevel(_ level: Float) -> Float {
+        guard level.isFinite else { return 0 }
+        return min(max(level, 0), 1)
     }
 }
 
@@ -137,9 +119,8 @@ final class SystemTorchDevice: TorchDevice, @unchecked Sendable {
 /// immediate stop request on every exit path. A stop is a software request: if the off command
 /// fails it is reported via `offCommandError`.
 ///
-/// Timing: flashes are played by `TorchDriver` on a dedicated high-priority thread against
-/// absolute edge times (no cumulative drift), so UI work cannot delay or drop them.
-/// `lockForConfiguration` latency and the LED driver still add some jitter.
+/// API commands run on a dedicated thread. Scheduling and platform latency can cause an
+/// overrun stop; neither software timestamps nor command success measure optical output.
 @MainActor
 final class TorchController {
     nonisolated static let bounds = LightBounds.standard
@@ -234,7 +215,7 @@ final class TorchController {
         driver?.setPeak(min(level, Self.bounds.brightnessCeiling))
     }
 
-    /// Flash timing measured by the playback thread for the current run.
+    /// API-command timing recorded by the playback thread, not optical measurements.
     var timingStats: TorchDriver.Stats? { driver?.stats }
 
     /// Cancels all pending callbacks, then requests torch off. Idempotent.
@@ -319,9 +300,10 @@ final class TorchController {
     private func hardStop(_ reason: TorchStopReason, notify: Bool) {
         let wasRunning = isRunning
         generation += 1
-        // Synchronous: once this returns, the playback thread can issue no further command,
-        // so the off request below is guaranteed to be the last one.
+        // Join serialized worker shutdown before reusing the hardware. Hardware calls have
+        // no bounded latency; UI stats and brightness state use a separate lock.
         driver?.cancel()
+        let workerOffError = driver?.offCommandError
         driver = nil
         watchdog?.cancel()
         watchdog = nil
@@ -341,6 +323,9 @@ final class TorchController {
                 if attempt == 2 { break }
             }
         }
+        // A successful cleanup retry must not erase an earlier worker off rejection before
+        // SessionPlayer has had the chance to persist its shutdown warning.
+        if let workerOffError { offCommandError = workerOffError }
         currentLevel = 0
         guard wasRunning else { return }
         lastStopReason = reason
