@@ -57,6 +57,17 @@ xcodebuild build \
   CODE_SIGNING_REQUIRED=NO
 echo "::endgroup::"
 
+echo "::group::Build Debug (light-enabled, what Xcode Run installs) for generic iOS device (unsigned)"
+xcodebuild build \
+  -project "$PROJECT" \
+  -scheme "$SCHEME" \
+  -configuration Debug \
+  -destination "generic/platform=iOS" \
+  -derivedDataPath "$DERIVED_DATA" \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO
+echo "::endgroup::"
+
 echo "::group::Unit tests on simulator"
 xcodebuild test \
   -project "$PROJECT" \

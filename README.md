@@ -22,18 +22,22 @@ Official Apple references: [free account and Personal Team limits](https://devel
 
 - An original session library with search, intent filters, and saved favourites.
 - Original procedural ambient soundscapes, adjustable session duration and volume, and an option to continue playing music from another app.
-- A journey builder that saves an ordered queue of up to five sessions. Journeys are audio only in this prototype.
+- A journey builder that saves an ordered queue of up to five sessions; with light on, each session runs its own recommended (or chosen) light program.
 - Intention setting, pause/resume/early stop, session history, and a private local journal with mood notes, editing, deletion, and sharing/export.
-- An explicitly experimental, opt-in native torch mode in **Debug development builds only**, with a preparation delay, bounded output, stop controls, and interruption handling. Light is off by default, unavailable for sleep sessions and journeys, and requires a fresh risk acknowledgement each session. Release/Archive builds keep light disabled.
+- Flicker light through closed eyelids (**Debug builds only**, which is what Xcode installs when you press Run). Light follows a program whose frequency glides over the session instead of flashing at one fixed rate:
+  - **Unwind** (calm, 10 → 6 Hz and back), **Steady** (focus, 10–12 Hz), **Explore** (reflect, builds to 10–12 Hz), **Deep** (8 → 4.5 Hz theta and back), **Drift off** (sleep, 6 → 2 Hz, dimming, switches itself off after 20 minutes), and **Custom** (your own start/end frequency).
+  - Each session uses the program recommended for its intent unless you pick another. Brightness is adjustable from 5% to 100% of the torch, before and during a session.
+  - 15 s dark lead-in, 20 s fade-in, fade-out and quiet outro before the session ends. Pause/resume and leaving/returning to the app stop and resume the light after a short dark hold. The screen stays awake during light sessions.
+  - Hard limits: 1–15 Hz, 20–70% duty, 60 minutes of light, stop on warmth/interruptions/hardware errors. A safety check is required first and repeats every 30 days. Release/Archive builds keep light disabled.
 - Offline operation, without account creation, subscriptions, advertising, analytics, or an AI service.
 
 The [feature comparison](docs/FEATURE-MATRIX.md) distinguishes implemented workflows from features that remain outside this prototype.
 
 ## Read before testing light
 
-Flashing light can trigger seizures and other adverse effects, including in someone without a known history. Closing the eyes, lowering brightness, or passing a self-report checklist does not establish safety. The original sequence here is an **unvalidated engineering prototype**, not a clinically validated dose or a reconstruction of Lumenate's protocol. There are no claims of equivalent experience, medical benefit, or safety.
+Flashing light can trigger seizures and other adverse effects, including in someone without a known history. Closing the eyes, lowering brightness, or passing a self-report checklist does not establish safety. The light programs here are **not clinically validated doses** and not a reconstruction of Lumenate's protocol. There are no claims of equivalent experience, medical benefit, or safety.
 
-Start by verifying controls without exposing anyone to the torch. The Debug engineering smoke test requests nominal 3 Hz at 50% duty, a torch level capped at 0.02, a 10-second positioning delay, and at most 30 seconds of light. Those are arbitrary engineering test settings, not a validated exposure or a value set taken from a study. A device's numeric torch fraction is not a measurement of optical intensity. Physical output timing, failure behavior, device heating, and shutdown behavior have not been measured on an iPhone. The [science and safety report](docs/research/science-and-safety.md) explains the evidence, contraindication context, limitations, and required verification. Audio-only use remains available.
+The light programs are original designs informed by the published flicker studies (3, 8, 10 and 18 Hz rhythmic flicker at 30–50% duty; imagery strongest around 10 Hz) and Lumenate's public statement that its sleep content sits around 3 Hz. Lumenate's actual per-session sequences are proprietary and are not reproduced. On your first run, point the torch away from you to see the behavior, and start with lower brightness. Flash timing is scheduled on the main thread; small jitter from the system and LED driver is expected and has not been measured with a photodiode. The [science and safety report](docs/research/science-and-safety.md) explains the evidence, contraindication context, limitations, and required verification. Audio-only use remains available.
 
 ## Research and verification
 

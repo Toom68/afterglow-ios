@@ -2,6 +2,22 @@
 
 Prepared on **31 October 2026** for the user's later Mac session. The deliverable is an **untested iOS source prototype**, with research and installation instructions. It is not a signed IPA, TestFlight build, App Store release, verified Lumenate replacement, or approval for eye-directed light exposure.
 
+## CI-verified build (3 November 2026)
+
+The project is now on GitHub (`Toom68/afterglow-ios`) and `.github/workflows/ios.yml` runs on
+a macOS runner with the newest installed Xcode (26.3 at the time). Each push performs an
+unsigned Release build for a generic iOS device and runs the full XCTest suite in Debug on
+an iPhone simulator. See the Actions tab for the latest result.
+
+The first CI run found a compile error that the Windows checks had missed
+(`RadialGradient` needed its `center:` argument in `Components.swift`) and one failing test
+(acknowledging a torch shutdown warning was immediately re-raised by the stale controller).
+Both are fixed.
+
+The fixed 30-second, 3 Hz "engineering smoke test" has been replaced by the program-based
+light engine described in the README. Real torch output can only be checked on a physical
+iPhone; the simulator has no torch.
+
 ## First Mac build follow-up
 
 The user's first Xcode build reported a missing `ScaledMetric` wrapped value and three
