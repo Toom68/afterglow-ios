@@ -97,11 +97,39 @@ final class SystemTorchDevice: TorchDevice, @unchecked Sendable {
             return
         }
         guard device.isTorchAvailable else { throw TorchError.torchUnavailable }
+        // `setTorchModeOn(level:)` is slow and erratic when called for every flash, which made
+        // the hardware fall behind fast flicker. Set the level only when it changes (quantised
+        // so fades don't change it on every flash) and flash with the fast `torchMode` toggle.
+        let quantised = Self.quantise(level)
+        if fastToggleWorks, configuredLevel == quantised {
+            device.torchMode = .on
+            if !verifiedFastToggle {
+                verifiedFastToggle = true
+                // If this device ignores the stored level on a plain toggle, stop using it.
+                if abs(device.torchLevel - quantised) > 0.15 { fastToggleWorks = false; try setExplicitly(quantised, on: device) }
+            }
+            return
+        }
+        try setExplicitly(quantised, on: device)
+    }
+
+    private var configuredLevel: Float?
+    private var fastToggleWorks = true
+    private var verifiedFastToggle = false
+
+    private func setExplicitly(_ level: Float, on device: AVCaptureDevice) throws {
         do {
             try device.setTorchModeOn(level: level)
+            configuredLevel = level
         } catch {
+            configuredLevel = nil
             throw TorchError.configurationFailed(error.localizedDescription)
         }
+    }
+
+    /// Steps of 5%, never zero, never above the maximum the API accepts.
+    static func quantise(_ level: Float) -> Float {
+        min(max((level * 20).rounded() / 20, 0.05), 1)
     }
 }
 
