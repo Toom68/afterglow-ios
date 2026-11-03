@@ -28,7 +28,11 @@ jobs:
         env:
           XCODE_APP: ${{ vars.XCODE_APP }}
         run: |
-          if [ -n "$XCODE_APP" ]; then sudo xcode-select -s "/Applications/$XCODE_APP.app/Contents/Developer"; fi
+          ls -d /Applications/Xcode*.app
+          if [ -z "$XCODE_APP" ]; then
+            XCODE_APP="$(ls -d /Applications/Xcode_*.app | sed 's#.*/##; s#\.app$##' | sort -V | tail -1)"
+          fi
+          sudo xcode-select -s "/Applications/$XCODE_APP.app/Contents/Developer"
           xcodebuild -version
           xcrun simctl list runtimes
 

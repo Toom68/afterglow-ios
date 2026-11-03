@@ -25,7 +25,7 @@ struct GlowOrb: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(RadialGradient(colors: [tint.opacity(0.25), tint.opacity(0.04), .clear], startRadius: 0, endRadius: size * 0.5))
+                .fill(RadialGradient(colors: [tint.opacity(0.25), tint.opacity(0.04), .clear], center: .center, startRadius: 0, endRadius: size * 0.5))
             ForEach(0..<9) { index in
                 Circle()
                     .stroke(tint.opacity(0.10 + Double(index) * 0.022), lineWidth: index == 6 ? 1.8 : 0.7)
