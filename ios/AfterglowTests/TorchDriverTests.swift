@@ -5,6 +5,8 @@ import XCTest
 final class RecordingTorch: TorchDevice, @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [Float] = []
+    private var exclusive = 0
+    private var exclusiveEver = false
     var hasTorch: Bool { true }
     var isTorchAvailable: Bool { true }
     var maxAvailableLevel: Float { 1 }
@@ -13,6 +15,26 @@ final class RecordingTorch: TorchDevice, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return recorded
+    }
+
+    /// (currently held, ever held)
+    var exclusiveState: (held: Bool, ever: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (exclusive > 0, exclusiveEver)
+    }
+
+    func beginExclusiveControl() throws {
+        lock.lock()
+        exclusive += 1
+        exclusiveEver = true
+        lock.unlock()
+    }
+
+    func endExclusiveControl() {
+        lock.lock()
+        exclusive = max(0, exclusive - 1)
+        lock.unlock()
     }
 
     func setLevel(_ level: Float) throws {
@@ -76,6 +98,33 @@ final class TorchDriverTests: XCTestCase {
         XCTAssertGreaterThan(count, 0)
         Thread.sleep(forTimeInterval: 0.35)
         XCTAssertEqual(torch.levels.count, count, "Nothing after cancel")
+    }
+
+    func testHoldsTheHardwareLockForTheRunAndAlwaysReleasesIt() {
+        let torch = RecordingTorch()
+        let driver = makeDriver(steady(10, seconds: 10), torch: torch)
+        driver.start()
+        Thread.sleep(forTimeInterval: 0.25)
+        XCTAssertTrue(torch.exclusiveState.held, "Locked once for the whole run")
+        driver.cancel()
+        XCTAssertFalse(torch.exclusiveState.held, "Released by cancel")
+
+        let finishedTorch = RecordingTorch()
+        let finished = expectation(description: "finished")
+        makeDriver(steady(10, seconds: 0.3), torch: finishedTorch) { _ in finished.fulfill() }.start()
+        wait(for: [finished], timeout: 3)
+        XCTAssertTrue(finishedTorch.exclusiveState.ever)
+        XCTAssertFalse(finishedTorch.exclusiveState.held, "Released when the plan ends")
+    }
+
+    func testReportsTheRateActuallyDelivered() {
+        let torch = RecordingTorch()
+        let driver = makeDriver(steady(12, seconds: 10), torch: torch)
+        driver.start()
+        Thread.sleep(forTimeInterval: 2.0)
+        let rate = driver.stats.achievedRate ?? 0
+        driver.cancel()
+        XCTAssertEqual(rate, 12, accuracy: 0.6)
     }
 
     func testBrightnessChangeAppliesToLaterFlashes() {

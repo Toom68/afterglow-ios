@@ -40,11 +40,22 @@ protocol TorchDevice: AnyObject {
     var maxAvailableLevel: Float { get }
     /// Level 0 turns the torch off.
     func setLevel(_ level: Float) throws
+    /// Holds the hardware configuration lock across many `setLevel` calls, so fast flashing
+    /// doesn't pay the lock/unlock cost on every edge. Balanced by `endExclusiveControl()`.
+    func beginExclusiveControl() throws
+    func endExclusiveControl()
+}
+
+extension TorchDevice {
+    func beginExclusiveControl() throws {}
+    func endExclusiveControl() {}
 }
 
 /// Controls only the torch: no frames are captured and no capture session is created.
-final class SystemTorchDevice: TorchDevice {
+/// Not internally synchronised: callers serialise access (see `TorchDriver`).
+final class SystemTorchDevice: TorchDevice, @unchecked Sendable {
     private let device: AVCaptureDevice?
+    private var holdsLock = false
 
     init(device: AVCaptureDevice? = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)) {
         self.device = device
@@ -54,14 +65,33 @@ final class SystemTorchDevice: TorchDevice {
     var isTorchAvailable: Bool { device?.isTorchAvailable ?? false }
     var maxAvailableLevel: Float { AVCaptureDevice.maxAvailableTorchLevel }
 
-    func setLevel(_ level: Float) throws {
-        guard let device, device.hasTorch else { throw TorchError.noTorch }
+    func beginExclusiveControl() throws {
+        guard let device, !holdsLock else { return }
         do {
             try device.lockForConfiguration()
         } catch {
             throw TorchError.configurationFailed(error.localizedDescription)
         }
-        defer { device.unlockForConfiguration() }
+        holdsLock = true
+    }
+
+    func endExclusiveControl() {
+        guard let device, holdsLock else { return }
+        holdsLock = false
+        device.unlockForConfiguration()
+    }
+
+    func setLevel(_ level: Float) throws {
+        guard let device, device.hasTorch else { throw TorchError.noTorch }
+        let lockedHere = !holdsLock
+        if lockedHere {
+            do {
+                try device.lockForConfiguration()
+            } catch {
+                throw TorchError.configurationFailed(error.localizedDescription)
+            }
+        }
+        defer { if lockedHere { device.unlockForConfiguration() } }
         if level <= 0 {
             if device.torchMode != .off { device.torchMode = .off }
             return

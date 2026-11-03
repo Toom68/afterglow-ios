@@ -116,9 +116,11 @@ final class LightPolicyTests: XCTestCase {
     func testFadesRampTheLightInAndOut() {
         let plan = LightPlan(program: .custom(startHz: 10, endHz: 10), preparationDelay: 0, lightDuration: 120, peakTorchLevel: 1, fadeIn: 20, fadeOut: 20)
         let onsets = plan.edges.filter { $0.level > 0 }
-        XCTAssertEqual(onsets.first?.level ?? 0, 0.15, accuracy: 0.01, "Starts dim")
+        XCTAssertEqual(onsets.first?.level ?? 0, 0.5, accuracy: 0.01, "Starts at half brightness, clearly visible")
         XCTAssertEqual(plan.relativeLevel(at: 60.02) ?? 0, 1, accuracy: 1e-6, "Full in the middle")
-        XCTAssertLessThan(onsets.last?.level ?? 1, 0.2, "Ends dim")
+        XCTAssertLessThan(onsets.last?.level ?? 1, 0.55, "Ends dimmer")
+        let noFade = LightPlan(program: .custom(startHz: 10, endHz: 10), preparationDelay: 0, lightDuration: 10, peakTorchLevel: 1, fadeIn: 0, fadeOut: 0)
+        XCTAssertEqual(noFade.edges.first?.level, 1, "Without fades the first flash is full brightness")
     }
 
     func testBoundsRejectUnsafeOrMalformedPrograms() {
@@ -129,7 +131,8 @@ final class LightPolicyTests: XCTestCase {
         }
         XCTAssertTrue(valid { _ in })
         XCTAssertFalse(valid { $0.segments = [] })
-        XCTAssertFalse(valid { $0.segments[0].endHz = 20 }, "Above the 15 Hz ceiling")
+        XCTAssertTrue(valid { $0.segments[0].endHz = 20 }, "20 Hz is the ceiling")
+        XCTAssertFalse(valid { $0.segments[0].endHz = 25 }, "Above the 20 Hz ceiling")
         XCTAssertFalse(valid { $0.segments[0].startHz = 0.5 })
         XCTAssertFalse(valid { $0.segments[0].startHz = .nan })
         XCTAssertFalse(valid { $0.segments[0].weight = 0 })
@@ -153,8 +156,10 @@ final class LightPolicyTests: XCTestCase {
 
     func testSessionPlanLeavesLeadInAndOutro() {
         let plan = LightPlan.forSession(program: LightProgramCatalog.relax, sessionDuration: 600, brightness: 0.6)
-        XCTAssertEqual(plan.preparationDelay, 15)
-        XCTAssertEqual(plan.lightDuration, 600 - 15 - 60, accuracy: 1e-9)
+        XCTAssertEqual(plan.preparationDelay, 5)
+        XCTAssertEqual(plan.lightDuration, 600 - 5 - 60, accuracy: 1e-9)
+        let instant = LightPlan.forSession(program: LightProgramCatalog.relax, sessionDuration: 600, brightness: 0.6, leadIn: 0, fade: 0)
+        XCTAssertEqual(instant.edges.first?.time, 0, "Go with no lead-in flashes immediately")
         XCTAssertEqual(plan.peakTorchLevel, 0.6)
         XCTAssertTrue(plan.isWellFormed())
         let sleep = LightPlan.forSession(program: LightProgramCatalog.sleep, sessionDuration: 45 * 60, brightness: 0.6, maximumLight: LightProgramCatalog.sleepLightLimit)

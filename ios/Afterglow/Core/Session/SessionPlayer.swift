@@ -112,7 +112,7 @@ final class SessionPlayer: ObservableObject {
         usesTimer: Bool = true,
         integratesWithSystemMedia: Bool = true,
         lightBuildEnabled: Bool = LightFeature.buildAllowsLight,
-        lightLeadIn: TimeInterval = 15,
+        lightLeadIn: TimeInterval = 5,
         isAppActive: (@MainActor () -> Bool)? = nil,
         keepScreenAwake: (@MainActor (Bool) -> Void)? = nil,
         makeTorch: (@MainActor () -> TorchController)? = nil
@@ -281,8 +281,9 @@ final class SessionPlayer: ObservableObject {
             program: program,
             sessionDuration: configuration.duration,
             brightness: min(max(configuration.lightBrightness, 0.05), TorchController.bounds.brightnessCeiling),
-            leadIn: lightLeadIn,
-            maximumLight: sleepy ? LightProgramCatalog.sleepLightLimit : nil
+            leadIn: max(0, configuration.lightLeadIn ?? lightLeadIn),
+            maximumLight: sleepy ? LightProgramCatalog.sleepLightLimit : nil,
+            fade: configuration.lightFades ? 8 : 0
         )
         let offset = timeline.elapsed(at: clock())
         discardTorch()

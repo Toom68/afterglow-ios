@@ -14,7 +14,20 @@ final class SettingsStore: ObservableObject {
         static let lightCustomEndHz = "settings.light.customEndHz"
         static let lightPreferred = "settings.light.preferred"
         static let lightScreenedAt = "settings.light.screenedAt"
+        static let customDuty = "settings.light.customDuty"
+        static let quickMinutes = "settings.quick.minutes"
+        static let quickLeadIn = "settings.quick.leadIn"
+        static let quickFades = "settings.quick.fades"
+        static let quickSound = "settings.quick.sound"
     }
+
+    /// Sound choices for the Light tab besides the soundscapes.
+    enum QuickSound {
+        static let silent = "silent"
+        static let ownMusic = "own-music"
+    }
+
+    static let quickLeadInOptions: [TimeInterval] = [0, 5, 15, 30]
 
     static let minuteRange = 1...120
     static let brightnessRange: ClosedRange<Float> = 0.05...1
@@ -73,12 +86,41 @@ final class SettingsStore: ObservableObject {
         didSet { defaults.set(lightScreenedAt, forKey: Key.lightScreenedAt) }
     }
 
+    /// Share of each flash cycle the torch is on, for the custom program.
+    @Published var customDuty: Double {
+        didSet { defaults.set(Self.clampDuty(customDuty), forKey: Key.customDuty) }
+    }
+
+    /// Light tab: session length in minutes.
+    @Published var quickMinutes: Int {
+        didSet {
+            let clamped = min(max(quickMinutes, Self.minuteRange.lowerBound), Self.minuteRange.upperBound)
+            if clamped != quickMinutes { quickMinutes = clamped }
+            defaults.set(clamped, forKey: Key.quickMinutes)
+        }
+    }
+
+    /// Light tab: seconds of darkness before the first flash.
+    @Published var quickLeadIn: TimeInterval {
+        didSet { defaults.set(quickLeadIn, forKey: Key.quickLeadIn) }
+    }
+
+    /// Light tab: fade the light in and out.
+    @Published var quickFades: Bool {
+        didSet { defaults.set(quickFades, forKey: Key.quickFades) }
+    }
+
+    /// Light tab: a `Soundscape` raw value, `QuickSound.silent` or `QuickSound.ownMusic`.
+    @Published var quickSound: String {
+        didSet { defaults.set(quickSound, forKey: Key.quickSound) }
+    }
+
     var lightScreeningIsCurrent: Bool { LightScreening.isCurrent(screenedAt: lightScreenedAt) }
 
     /// The program the user picked, or nil for "automatic".
     var chosenLightProgram: LightProgram? {
         if lightProgramChoice == LightProgramCatalog.customID {
-            return .custom(startHz: Self.clampHz(customStartHz), endHz: Self.clampHz(customEndHz))
+            return .custom(startHz: Self.clampHz(customStartHz), endHz: Self.clampHz(customEndHz), dutyCycle: Self.clampDuty(customDuty))
         }
         return LightProgramCatalog.program(id: lightProgramChoice)
     }
@@ -99,10 +141,36 @@ final class SettingsStore: ObservableObject {
         customEndHz = Self.clampHz((defaults.object(forKey: Key.lightCustomEndHz) as? NSNumber)?.doubleValue ?? 6)
         lightPreferred = defaults.bool(forKey: Key.lightPreferred)
         lightScreenedAt = defaults.object(forKey: Key.lightScreenedAt) as? Date
+        customDuty = Self.clampDuty((defaults.object(forKey: Key.customDuty) as? NSNumber)?.doubleValue ?? 0.5)
+        let storedQuickMinutes = (defaults.object(forKey: Key.quickMinutes) as? NSNumber)?.intValue ?? 20
+        quickMinutes = min(max(storedQuickMinutes, Self.minuteRange.lowerBound), Self.minuteRange.upperBound)
+        quickLeadIn = (defaults.object(forKey: Key.quickLeadIn) as? NSNumber)?.doubleValue ?? 0
+        quickFades = (defaults.object(forKey: Key.quickFades) as? NSNumber)?.boolValue ?? false
+        quickSound = defaults.string(forKey: Key.quickSound) ?? Soundscape.drift.rawValue
     }
 
     static func clampHz(_ hz: Double) -> Double {
         let range = LightBounds.standard.frequencyRange
         return hz.isFinite ? min(max(hz, range.lowerBound), range.upperBound) : range.lowerBound
+    }
+
+    static func clampDuty(_ duty: Double) -> Double {
+        let range = LightBounds.standard.dutyRange
+        return duty.isFinite ? min(max(duty, range.lowerBound), range.upperBound) : 0.5
+    }
+
+    /// The Light tab's session, built from its saved choices.
+    func quickLightConfiguration() -> SessionConfiguration {
+        let soundscape = Soundscape(rawValue: quickSound) ?? .drift
+        var configuration = SessionConfiguration(preset: PresetCatalog.quickLight, minutes: quickMinutes, volume: volume)
+        configuration.soundscape = soundscape
+        configuration.mixWithOtherAudio = quickSound == QuickSound.ownMusic
+        if Soundscape(rawValue: quickSound) == nil { configuration.volume = 0 }
+        configuration.useLight = lightScreeningIsCurrent
+        configuration.lightProgram = chosenLightProgram ?? LightProgramCatalog.recommended(for: PresetCatalog.quickLight.intent)
+        configuration.lightBrightness = lightBrightness
+        configuration.lightLeadIn = quickLeadIn
+        configuration.lightFades = quickFades
+        return configuration
     }
 }

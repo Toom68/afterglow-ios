@@ -15,8 +15,26 @@ final class TorchDriver: @unchecked Sendable {
         var dropped = 0
         var maximumLateness: TimeInterval = 0
         var totalLateness: TimeInterval = 0
+        /// Time the hardware took to accept torch commands.
+        var commands = 0
+        var totalCommandTime: TimeInterval = 0
+        var maximumCommandTime: TimeInterval = 0
+        /// Actual on-times of the most recent flashes, for the achieved rate.
+        var recentFlashTimes: [TimeInterval] = []
 
         var averageLateness: TimeInterval { flashes > 0 ? totalLateness / Double(flashes) : 0 }
+        var averageCommandTime: TimeInterval { commands > 0 ? totalCommandTime / Double(commands) : 0 }
+
+        /// Flashes per second actually delivered over the last few flashes.
+        var achievedRate: Double? {
+            guard recentFlashTimes.count > 1, let first = recentFlashTimes.first, let last = recentFlashTimes.last, last > first else { return nil }
+            return Double(recentFlashTimes.count - 1) / (last - first)
+        }
+
+        mutating func recordFlash(at time: TimeInterval) {
+            recentFlashTimes.append(time)
+            if recentFlashTimes.count > 21 { recentFlashTimes.removeFirst() }
+        }
     }
 
     /// A flash always lasts at least this share of its planned length.
@@ -84,6 +102,7 @@ final class TorchDriver: @unchecked Sendable {
     func cancel() {
         commandLock.lock()
         cancelled = true
+        device.endExclusiveControl()
         commandLock.unlock()
         wake.signal()
     }
@@ -110,11 +129,18 @@ final class TorchDriver: @unchecked Sendable {
         commandLock.lock()
         let alreadyCancelled = cancelled
         cancelled = true
+        device.endExclusiveControl()
         commandLock.unlock()
         if !alreadyCancelled { onStop(reason) }
     }
 
     private func run() {
+        commandLock.lock()
+        if cancelled { commandLock.unlock(); return }
+        // If the lock can't be held, every command simply locks on its own (slower, still works).
+        try? device.beginExclusiveControl()
+        commandLock.unlock()
+
         let edges = plan.edges
         // Skip edges inside the dark hold after a resume; the torch stays off until then.
         var index = edges.firstIndex { $0.time >= holdUntil - 1e-9 } ?? edges.count
@@ -154,19 +180,26 @@ final class TorchDriver: @unchecked Sendable {
             if failure == nil {
                 let level = current.level > 0 ? current.level * min(ceiling, peak, device.maxAvailableLevel) : 0
                 if level != currentLevel {
+                    let commandStart = clock()
                     do {
                         try device.setLevel(level)
                         currentLevel = level
                     } catch {
                         failure = .failure(error as? TorchError ?? .configurationFailed(error.localizedDescription))
                     }
+                    let commandTime = clock() - commandStart
+                    statsValue.commands += 1
+                    statsValue.totalCommandTime += commandTime
+                    statsValue.maximumCommandTime = max(statsValue.maximumCommandTime, commandTime)
                 }
                 if failure == nil, current.level > 0 {
                     let lateness = max(0, now - current.time)
+                    let onAt = elapsed
                     statsValue.flashes += 1
                     statsValue.totalLateness += lateness
                     statsValue.maximumLateness = max(statsValue.maximumLateness, lateness)
-                    lastOnActual = elapsed
+                    statsValue.recordFlash(at: onAt)
+                    lastOnActual = onAt
                     lastOnPlanned = current.time
                 }
             }

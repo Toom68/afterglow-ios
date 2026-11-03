@@ -10,10 +10,12 @@ struct RootView: View {
         TabView(selection: $tab) {
             DiscoverView()
                 .tabItem { Label("Discover", systemImage: "circle.hexagongrid") }.tag(0)
+            LightView()
+                .tabItem { Label("Light", systemImage: "flashlight.on.fill") }.tag(1)
             JournalView()
-                .tabItem { Label("Reflect", systemImage: "book.closed") }.tag(1)
+                .tabItem { Label("Reflect", systemImage: "book.closed") }.tag(2)
             SettingsView(lightStatus: LightFeature.statusExplanation, onEraseHistory: { history.eraseAll() })
-                .tabItem { Label("About", systemImage: "circle.dotted") }.tag(2)
+                .tabItem { Label("About", systemImage: "circle.dotted") }.tag(3)
         }
         .toolbarBackground(AfterglowTheme.background, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)

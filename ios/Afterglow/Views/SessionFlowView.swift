@@ -29,10 +29,22 @@ struct SessionFlowView: View {
 
     private enum Stage { case prepare, listen, reflect }
 
+    /// Set for the Light tab: skips preparation and starts this configuration straight away.
+    private let quickStart: SessionConfiguration?
+
     init(preset: SessionPreset, journey: [SessionPreset] = []) {
         self.sequence = journey.isEmpty ? [preset] : Array(journey.prefix(5))
+        quickStart = nil
         _minutes = State(initialValue: preset.defaultMinutes)
         _soundscape = State(initialValue: preset.soundscape)
+    }
+
+    init(quickStart configuration: SessionConfiguration) {
+        sequence = [PresetCatalog.quickLight]
+        quickStart = configuration
+        _minutes = State(initialValue: Int(configuration.duration / 60))
+        _soundscape = State(initialValue: configuration.soundscape)
+        _stage = State(initialValue: .listen)
     }
 
     var body: some View {
@@ -85,6 +97,12 @@ struct SessionFlowView: View {
             .onAppear {
                 guard !loadedLightPreference else { return }
                 loadedLightPreference = true
+                if let quickStart {
+                    useLight = quickStart.useLight && lightSelectable
+                    ownMusic = quickStart.mixWithOtherAudio
+                    player.start(quickStart)
+                    return
+                }
                 useLight = lightSelectable && settings.lightPreferred && settings.lightScreeningIsCurrent
             }
             // Subscribe to events rather than view rendering: completion must advance an audio
@@ -234,7 +252,7 @@ struct SessionFlowView: View {
             VStack(spacing: 27) {
                 VStack(spacing: 10) {
                     Text(preset.title).agFont(32, weight: .regular, design: .serif)
-                    Text((ownMusic ? "Your own music" : soundscape.title) + (useLight ? " · With light" : " · Audio session"))
+                    Text((ownMusic ? "Your own music" : quickStart?.volume == 0 ? "Silent" : soundscape.title) + (useLight ? " · With light" : " · Audio session"))
                         .agFont(12).foregroundStyle(AfterglowTheme.muted)
                     if isJourney {
                         Text("JOURNEY  \(sequenceIndex + 1) / \(sequence.count)")
@@ -382,7 +400,7 @@ struct SessionFlowView: View {
         let sleepNote = preset.intent == .sleep || activeProgram.id == LightProgramCatalog.sleep.id
             ? " Sleep light switches itself off after at most \(Int(LightProgramCatalog.sleepLightLimit / 60)) minutes."
             : ""
-        return "15 seconds of darkness to settle, then the light fades in over 20 seconds and fades out before the session ends. Pausing turns it off; resuming or returning to Afterglow brings it back after a few dark seconds.\(sleepNote)"
+        return "5 seconds of darkness to settle, then the light starts at half brightness, reaches full within 8 seconds, and fades out before the session ends. Pausing turns it off; resuming or returning to Afterglow brings it back after a few dark seconds.\(sleepNote)"
     }
 
     private var lightCard: some View {
@@ -419,6 +437,10 @@ struct SessionFlowView: View {
                     if settings.lightProgramChoice == LightProgramCatalog.customID {
                         hzSlider("Start", value: $settings.customStartHz)
                         hzSlider("End", value: $settings.customEndHz)
+                        if max(settings.customStartHz, settings.customEndHz) > 15 {
+                            Text("Above 15 Hz is the range most likely to trigger photosensitive seizures.")
+                                .agFont(11).foregroundStyle(AfterglowTheme.gold)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
@@ -483,7 +505,7 @@ struct SessionFlowView: View {
                 }
                 .agFont(12).foregroundStyle(AfterglowTheme.muted)
                 if let timing = player.lightTiming, timing.flashes > 0 {
-                    Text("\(timing.flashes) flashes · \(timing.dropped) dropped · avg \(String(format: "%.1f", timing.averageLateness * 1000)) ms late · max \(String(format: "%.0f", timing.maximumLateness * 1000)) ms")
+                    Text("target \(player.lightFrequency.map { String(format: "%.1f", $0) } ?? "–") / actual \(timing.achievedRate.map { String(format: "%.1f", $0) } ?? "–") Hz · \(timing.flashes) flashes · \(timing.dropped) dropped · late \(String(format: "%.1f", timing.averageLateness * 1000)) ms · torch \(String(format: "%.1f", timing.averageCommandTime * 1000))/\(String(format: "%.0f", timing.maximumCommandTime * 1000)) ms")
                         .agFont(9, design: .monospaced).foregroundStyle(AfterglowTheme.muted)
                         .accessibilityLabel("Flash timing")
                 }
@@ -512,6 +534,11 @@ struct SessionFlowView: View {
     }
 
     private func begin() {
+        if let quickStart {
+            stage = .listen
+            player.start(quickStart)
+            return
+        }
         var configuration = SessionConfiguration(preset: preset, minutes: minutes, volume: settings.volume)
         configuration.soundscape = soundscape
         configuration.volume = ownMusic ? 0 : settings.volume
@@ -580,7 +607,7 @@ struct SessionFlowView: View {
     }
 }
 
-private struct LightScreeningView: View {
+struct LightScreeningView: View {
     @Environment(\.dismiss) private var dismiss
     var onOptIn: () -> Void
     @State private var adult = false

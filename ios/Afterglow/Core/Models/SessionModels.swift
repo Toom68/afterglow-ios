@@ -180,8 +180,20 @@ enum PresetCatalog {
         )
     ]
 
+    /// The Light tab's one-tap session. Not listed in the library.
+    static let quickLight = SessionPreset(
+        id: "quick-light",
+        title: "Light",
+        subtitle: "Your own light session",
+        intent: .reflect,
+        soundscape: .drift,
+        durationOptionsMinutes: [10, 20, 30],
+        defaultMinutes: 20,
+        symbolName: "flashlight.on.fill"
+    )
+
     static func preset(id: String) -> SessionPreset? {
-        all.first { $0.id == id }
+        id == quickLight.id ? quickLight : all.first { $0.id == id }
     }
 }
 
@@ -203,6 +215,10 @@ struct SessionConfiguration: Codable, Hashable {
     var lightProgram: LightProgram?
     /// Requested torch level at full program intensity.
     var lightBrightness: Float = 0.6
+    /// Seconds of darkness before light starts; nil uses the player's default.
+    var lightLeadIn: TimeInterval?
+    /// Fade the light in at the start and out at the end.
+    var lightFades = true
 
     var intent: SessionIntent? { PresetCatalog.preset(id: presetID)?.intent }
 

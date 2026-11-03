@@ -73,8 +73,8 @@ struct LightProgram: Identifiable, Codable, Hashable {
 
 /// Hard global limits every program and plan must respect, whatever its source.
 struct LightBounds: Hashable {
-    /// Flashes per second. Photosensitive responses are most often reported around 15–25 Hz,
-    /// so the ceiling stays below that band.
+    /// Flashes per second. Photosensitive responses are most often reported around 15–25 Hz;
+    /// built-in programs stay below 15 Hz and the UI warns when a custom rate goes above it.
     var frequencyRange: ClosedRange<Double>
     var dutyRange: ClosedRange<Double>
     /// Shortest on or off pulse accepted (main-queue scheduling resolution).
@@ -83,7 +83,7 @@ struct LightBounds: Hashable {
     var brightnessCeiling: Float
 
     static let standard = LightBounds(
-        frequencyRange: 1...15,
+        frequencyRange: 1...20,
         dutyRange: 0.2...0.7,
         minimumPulse: 0.012,
         maximumLightDuration: 60 * 60,
@@ -125,11 +125,11 @@ struct LightPlan {
 
     /// Builds a plan for a session of `sessionDuration`: a lead-in in darkness, light, then a
     /// quiet outro so the session ends without flicker.
-    static func forSession(program: LightProgram, sessionDuration: TimeInterval, brightness: Float, leadIn: TimeInterval = 15, maximumLight: TimeInterval? = nil, bounds: LightBounds = .standard) -> LightPlan {
+    static func forSession(program: LightProgram, sessionDuration: TimeInterval, brightness: Float, leadIn: TimeInterval = 5, maximumLight: TimeInterval? = nil, fade: TimeInterval = 8, bounds: LightBounds = .standard) -> LightPlan {
         let outro = min(90, sessionDuration * 0.1)
         var light = sessionDuration - leadIn - outro
         if let maximumLight { light = min(light, maximumLight) }
-        return LightPlan(program: program, preparationDelay: leadIn, lightDuration: max(light, 0), peakTorchLevel: brightness, bounds: bounds)
+        return LightPlan(program: program, preparationDelay: leadIn, lightDuration: max(light, 0), peakTorchLevel: brightness, fadeIn: fade, fadeOut: fade, bounds: bounds)
     }
 
     func isWellFormed(bounds: LightBounds = .standard) -> Bool {
@@ -188,7 +188,8 @@ struct LightPlan {
             let on = max(period * program.dutyCycle, bounds.minimumPulse)
             let rampIn = fadeIn > 0 ? min(1, t / fadeIn) : 1
             let rampOut = fadeOut > 0 ? min(1, (duration - t) / fadeOut) : 1
-            let envelope = 0.15 + 0.85 * min(rampIn, rampOut)
+            // Fades start at half brightness so the flicker is clearly there from the first flash.
+            let envelope = 0.5 + 0.5 * min(rampIn, rampOut)
             let level = Float(min(max(profile.intensity * envelope, 0), 1))
             if level > 0 {
                 edges.append(Edge(time: delay + t, level: level))
@@ -416,8 +417,9 @@ enum LightFeature {
     """
 
     static let disclosure = """
-    Light mode flashes the phone's flashlight through your closed eyelids at 1–15 Hz, gliding \
-    between frequencies over the session, with a dark lead-in and a fade in and out. These \
+    Light mode flashes the phone's flashlight through your closed eyelids, gliding between \
+    frequencies over the session (built-in programs stay at 2–14 Hz; custom rates go up to \
+    20 Hz), with a short dark lead-in and a fade in and out. These \
     programs are original designs informed by published flicker research; they are not \
     Lumenate's sequences and not a validated or medical treatment. Flashing light can trigger \
     seizures, including in people with no known history.
