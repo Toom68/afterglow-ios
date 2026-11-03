@@ -27,8 +27,10 @@ Official Apple references: [free account and Personal Team limits](https://devel
 - Flicker light through closed eyelids (**Debug builds only**, which is what Xcode installs when you press Run). Light follows a program whose frequency glides over the session instead of flashing at one fixed rate:
   - **Unwind** (calm, 10 → 6 Hz and back), **Steady** (focus, 10–12 Hz), **Explore** (reflect, builds to 10–12 Hz), **Deep** (8 → 4.5 Hz theta and back), **Drift off** (sleep, 6 → 2 Hz, dimming, switches itself off after 20 minutes), and **Custom** (your own start/end frequency).
   - Each session uses the program recommended for its intent unless you pick another. Brightness is adjustable from 5% to 100% of the torch, before and during a session.
-  - 15 s dark lead-in, 20 s fade-in, fade-out and quiet outro before the session ends. Pause/resume and leaving/returning to the app stop and resume the light after a short dark hold. The screen stays awake during light sessions.
-  - Hard limits: 1–15 Hz, 20–70% duty, 60 minutes of light, stop on warmth/interruptions/hardware errors. A safety check is required first and repeats every 30 days. Release/Archive builds keep light disabled.
+  - **Light tab:** one big **Go** button that starts at once, with every setting on the same page: pattern (any program, or Custom with a fixed rate or a glide, flash length/duty), brightness, length, dark lead-in (none to 30 s), fades on/off, and sound (any soundscape, silent, or your own music from another app).
+  - 5 s dark lead-in (none by default on the Light tab), fade-in from half brightness over 8 s, fade-out and a quiet outro before the session ends. Pause/resume and leaving/returning to the app stop and resume the light after a short dark hold. The screen stays awake during light sessions.
+  - Flashes run on a dedicated high-priority thread that holds the camera lock for the whole run, so screen updates can't delay or drop them. The live light card shows target vs actual Hz, dropped flashes and torch command time.
+  - Hard limits: 1–20 Hz (built-in programs stay at or below 12 Hz; the app warns above 15 Hz), 20–70% duty, 60 minutes of light, stop on warmth/interruptions/hardware errors. A safety check is required first and repeats every 30 days. Release/Archive builds keep light disabled.
 - Offline operation, without account creation, subscriptions, advertising, analytics, or an AI service.
 
 The [feature comparison](docs/FEATURE-MATRIX.md) distinguishes implemented workflows from features that remain outside this prototype.
